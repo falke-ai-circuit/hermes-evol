@@ -527,6 +527,23 @@ class EvolEngine:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
+    def memorize(self, force: bool = False) -> Dict[str, Any]:
+        """Standalone memory consolidation — score findings, adjust weights,
+        promote to Knowledge wiki, edit circuit, demote stale, detect cross-cycle patterns."""
+        if not force and not self._check_cooldown("memorize"):
+            return {"status": "skipped", "reason": "cooldown"}
+        try:
+            # Call memorize_standalone from registry with accumulated context
+            from hermes_evol.registry import memorize as _memorize
+            reflected = {"patterns": [], "anomalies": [], "bridge_signals": []}
+            expressed = None
+            explored = {"discoveries": [], "queries": []}
+            result = _memorize(self.cfg, reflected, expressed, explored)
+            self._set_cooldown("memorize")
+            return {"status": "ok", "data": result}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
     # ── Lifecycle ──
 
     def start(self):
