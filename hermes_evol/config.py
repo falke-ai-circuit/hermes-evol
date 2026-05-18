@@ -230,7 +230,7 @@ class EvolConfig:
         # ── Set dataclass defaults (custom __init__ must do this explicitly) ──
         self.mode = "profile"
         self.enabled = True
-        self.edit_mode = "suggested"
+        self.edit_mode = "auto"
         self.phase_enabled = {
             "absorb": True, "reflect": True, "explore": True,
             "express": True, "memorize": True,
@@ -249,7 +249,7 @@ class EvolConfig:
         self.idle_trigger_minutes = 30
         self.activity_trigger_tasks = 1
         self.global_profiles = []
-        self.search_backend = "duckduckgo"
+        self.search_backend = "wikipedia"
         self.search_backend_url = ""
         self.search_api_key = ""
         self.max_retries_per_phase = 3
