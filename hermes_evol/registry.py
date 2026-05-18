@@ -342,21 +342,97 @@ def absorb(cfg: EvolConfig) -> Dict[str, Any]:
         except (OSError, json.JSONDecodeError):
             pass
 
-    # ── LCM session summary — try native Hermes API ──
+    # ── LCM session summary — real user messages from JSONL files ──
     try:
         data["session_summary"] = _gather_lcm_sessions(cfg)
     except Exception:
-        data["session_summary"] = "[lcm unavailable]"
+        data["session_summary"] = "[sessions unavailable]"
+
+    # ── Cycle context — temporal continuity between cycles ──
+    ctx_path = Path(cfg.profile_dir) / "evol" / "cycle_context.json"
+    if ctx_path.exists():
+        try:
+            data["cycle_context"] = json.loads(ctx_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            data["cycle_context"] = _init_cycle_context(cfg)
+    else:
+        data["cycle_context"] = _init_cycle_context(cfg)
+
+    # ── Kanban activity — recently completed tasks with metadata ──
+    kanban_db = Path(os.path.expanduser("~/.hermes/kanban/kanban.db"))
+    if kanban_db.exists():
+        try:
+            import sqlite3
+            conn = sqlite3.connect(f"file:{kanban_db}?mode=ro", uri=True)
+            cursor = conn.execute(
+                "SELECT id, title, assignee, completed_at, summary FROM tasks "
+                "WHERE status='done' AND completed_at IS NOT NULL "
+                "ORDER BY completed_at DESC LIMIT 10"
+            )
+            kanban_entries = []
+            for row in cursor.fetchall():
+                kanban_entries.append({
+                    "id": row[0], "title": row[1], "assignee": row[2],
+                    "completed_at": row[3], "summary": (row[4] or "")[:300],
+                })
+            conn.close()
+            data["kanban_recent"] = kanban_entries
+        except Exception:
+            data["kanban_recent"] = []
 
     return data
 
 
+def _init_cycle_context(cfg: EvolConfig) -> dict:
+    return {"cycle": 0, "trajectories": [], "last_monologue": "", "last_mood": "", "insights": [], "unanswered": []}
+
+
 def _gather_lcm_sessions(cfg: EvolConfig) -> str:
-    """Gather recent LCM session context directly from LCM DB (no gateway needed)."""
-    lcm_db = Path(cfg.profile_dir) / "lcm.db"
-    if lcm_db.exists():
-        return f"[lcm db: {lcm_db.stat().st_size} bytes]"
-    return "[no LCM db]"
+    """Gather recent session context from JSONL session files — real user messages, topics, themes."""
+    sessions_dir = Path(cfg.profile_dir) / "sessions"
+    if not sessions_dir.exists():
+        return "[no sessions directory]"
+
+    jsonl_files = sorted(sessions_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not jsonl_files:
+        return "[no session files]"
+
+    parts = []
+    for sf in jsonl_files[:3]:
+        try:
+            lines = sf.read_text().splitlines()
+            user_msgs = []
+            assistant_msgs = []
+            for line in lines:
+                if not line.strip() or not line.startswith("{"):
+                    continue
+                try:
+                    msg = json.loads(line)
+                    role = msg.get("role", "")
+                    content = msg.get("content", "")
+                    if role == "user":
+                        user_msgs.append(content[:300])
+                    elif role == "assistant" and len(assistant_msgs) < 3:
+                        assistant_msgs.append(content[:200])
+                except json.JSONDecodeError:
+                    continue
+            if user_msgs:
+                stamp = sf.stem
+                # Extract date for readability
+                date_str = stamp[:8] if len(stamp) >= 8 else stamp
+                parts.append(f"## Session {date_str}")
+                parts.append("### User messages:")
+                for m in user_msgs[-8:]:
+                    parts.append(f"- {m}")
+                if assistant_msgs:
+                    parts.append("### Assistant responses (condensed):")
+                    for m in assistant_msgs:
+                        parts.append(f"- {m}")
+                parts.append("")
+        except Exception:
+            pass
+
+    return "\n".join(parts) if parts else "[sessions unreadable]"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -447,11 +523,25 @@ def _build_reflect_prompt(cfg: EvolConfig, absorbed: Dict[str, Any]) -> str:
         parts.append(json.dumps(evol_log[-5:], indent=2))
         parts.append("")
 
-    # Session summary
-    sess = absorbed.get("session_summary", "")
-    if sess and sess != "[lcm unavailable]":
-        parts.append("## Recent Sessions")
-        parts.append(sess[:2000])
+    # ── Inject cycle_context into reflect prompt ──
+    ctx = absorbed.get("cycle_context", {})
+    if ctx:
+        parts.append("## Cycle Context (temporal continuity)")
+        parts.append(f"- Cycle: {ctx.get('cycle', 0)}")
+        parts.append(f"- Last mood: {ctx.get('last_mood', 'none')}")
+        parts.append(f"- Previous trajectories: {json.dumps(ctx.get('trajectories', [])[-3:])}")
+        parts.append(f"- Previous insights: {json.dumps(ctx.get('insights', [])[-5:])}")
+        parts.append(f"- Unanswered from last cycle: {json.dumps(ctx.get('unanswered', [])[-5:])}")
+        if ctx.get("last_monologue"):
+            parts.append(f"- Last monologue (excerpt): {ctx['last_monologue'][:300]}")
+        parts.append("")
+
+    # ── Kanban activity ──
+    kanban = absorbed.get("kanban_recent", [])
+    if kanban:
+        parts.append("## Recent Kanban Activity")
+        for k in kanban[:5]:
+            parts.append(f"- [{k.get('assignee', '?')}] {k.get('title', '?')}: {k.get('summary', '')[:200]}")
         parts.append("")
 
     # Gateway log tail
@@ -468,6 +558,13 @@ def _build_reflect_prompt(cfg: EvolConfig, absorbed: Dict[str, Any]) -> str:
     parts.append("- anomalies: list of unexpected signals with {signal, severity (0-1)}")
     parts.append("- circuit_health: object mapping circuit filenames to staleness scores (0=fresh, 1=stale)")
     parts.append("- bridge_signals: list of paradoxes or gaps with {type, detail}")
+    parts.append("- gaps: list of knowledge gaps needing external exploration (specific, searchable questions)")
+    parts.append("")
+    parts.append("PAY SPECIAL ATTENTION TO:")
+    parts.append("- Cross-cycle patterns: are problems repeating across cycles without resolution?")
+    parts.append("- Trajectory: is the organism evolving, plateauing, or degrading?")
+    parts.append("- Identity coherence: do SOUL/AGENTS/MEMORY/IDENTITY agree or diverge?")
+    parts.append("- The session content shows what Goran actually asked for — detect patterns in real conversations.")
     parts.append("")
     parts.append("CRITICAL: Output ONLY valid JSON. No markdown, no explanation outside the JSON object.")
 
@@ -535,9 +632,10 @@ def explore(cfg: EvolConfig, reflected: Dict[str, Any]) -> Dict[str, Any]:
     """
     model_cfg = cfg.get_phase_model("explore")
 
-    # Build explore prompt from reflect patterns
+    # Build explore prompt from reflect patterns + gaps + anomalies
     patterns = reflected.get("patterns", [])
     anomalies = reflected.get("anomalies", [])
+    gaps = reflected.get("gaps", [])
 
     prompt_parts = [
         f"# EVOL EXPLORE — {cfg.profile}",
@@ -553,9 +651,15 @@ def explore(cfg: EvolConfig, reflected: Dict[str, Any]) -> Dict[str, Any]:
         for a in anomalies[:3]:
             prompt_parts.append(f"- {a.get('signal', '?')} (severity: {a.get('severity', 0)})")
         prompt_parts.append("")
+    if gaps:
+        prompt_parts.append("## Knowledge Gaps (from REFLECT)")
+        for g in gaps:
+            prompt_parts.append(f"- {g}")
+        prompt_parts.append("")
     prompt_parts.append("## Instructions")
     prompt_parts.append("Return a JSON object with:")
-    prompt_parts.append('- queries: list of 1-3 specific search queries (strings)')
+    prompt_parts.append('- queries: list of 1-3 specific search queries (strings) — base these on gaps FIRST, then patterns')
+    prompt_parts.append('- arxiv: list of 0-2 arXiv-specific search terms for academic papers')
     prompt_parts.append("Output ONLY valid JSON.")
 
     system = (
@@ -565,18 +669,25 @@ def explore(cfg: EvolConfig, reflected: Dict[str, Any]) -> Dict[str, Any]:
 
     raw = _call_llm("\n".join(prompt_parts), model_cfg, cfg, system_prompt=system)
 
-    # Parse queries
+    # Parse queries (web + arxiv)
     queries = _parse_explore_queries(raw)
+    arxiv_terms = _parse_explore_arxiv(raw)
 
     # Execute searches
     results = _execute_searches(queries, cfg)
 
-    # Analyze discoveries
-    discoveries = _analyze_discoveries(cfg, results, model_cfg)
+    # Execute arXiv searches
+    arxiv_results = _execute_arxiv(arxiv_terms)
+
+    # Analyze discoveries from all sources
+    all_results = results + arxiv_results
+    discoveries = _analyze_discoveries(cfg, all_results, model_cfg)
 
     return {
         "queries": queries,
+        "arxiv_terms": arxiv_terms,
         "results": results,
+        "arxiv_results": arxiv_results,
         "discoveries": discoveries,
         "raw_llm_response": raw,
     }
@@ -597,6 +708,55 @@ def _parse_explore_queries(raw: str) -> List[str]:
     # Fallback: lines that look like search queries
     lines = [l.strip("- *").strip() for l in raw.splitlines() if l.strip()]
     return lines[:3]
+
+
+def _parse_explore_arxiv(raw: str) -> List[str]:
+    """Extract arXiv search terms from LLM response."""
+    json_str = raw
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", raw)
+    if m:
+        json_str = m.group(1)
+    try:
+        parsed = json.loads(json_str)
+        if isinstance(parsed, dict) and "arxiv" in parsed:
+            return parsed["arxiv"][:2]
+    except json.JSONDecodeError:
+        pass
+    return []
+
+
+def _execute_arxiv(terms: List[str]) -> List[Dict]:
+    """Query arXiv API for academic papers — free, no key required."""
+    results = []
+    for term in terms[:2]:
+        try:
+            url = (
+                f"http://export.arxiv.org/api/query"
+                f"?search_query=all:{urllib.parse.quote(term)}"
+                f"&start=0&max_results=3&sortBy=relevance"
+            )
+            req = urllib.request.Request(url, headers={"User-Agent": "EVOL/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw_xml = resp.read().decode()
+            # Parse basic <entry> fields
+            entries = re.findall(r"<entry>(.*?)</entry>", raw_xml, re.DOTALL)
+            for e in entries[:3]:
+                title_m = re.search(r"<title>(.*?)</title>", e)
+                summary_m = re.search(r"<summary>(.*?)</summary>", e)
+                url_m = re.search(r"<id>(.*?)</id>", e)
+                if title_m:
+                    results.append({
+                        "query": term,
+                        "source": "arxiv",
+                        "snippet": (
+                            f"{title_m.group(1).strip()}: "
+                            f"{(summary_m.group(1)[:300] if summary_m else '')}"
+                        ),
+                        "url": url_m.group(1).strip() if url_m else f"https://arxiv.org/search/?query={urllib.parse.quote(term)}",
+                    })
+        except Exception as e:
+            results.append({"query": term, "source": "arxiv-error", "snippet": str(e)[:200]})
+    return results
 
 
 def _execute_searches(queries: List[str], cfg: EvolConfig) -> List[Dict]:
@@ -759,7 +919,9 @@ def express(cfg: EvolConfig, reflected: Dict[str, Any], explored: Optional[Dict[
     patterns = reflected.get("patterns", [])
     anomalies = reflected.get("anomalies", [])
     bridge = reflected.get("bridge_signals", [])
+    gaps = reflected.get("gaps", [])
     discoveries = explored.get("discoveries", []) if explored else []
+    arxiv = explored.get("arxiv_results", []) if explored else []
 
     prompt_parts = [
         f"# EVOL EXPRESS — {cfg.profile} ({cfg.mode} mode)",
@@ -786,14 +948,38 @@ def express(cfg: EvolConfig, reflected: Dict[str, Any], explored: Optional[Dict[
         prompt_parts.append("\n## New Discoveries")
         for d in discoveries[:3]:
             prompt_parts.append(f"- {d.get('topic', '?')}: {d.get('finding', '')[:200]}")
+    if arxiv:
+        prompt_parts.append("\n## arXiv Papers")
+        for a in arxiv[:2]:
+            prompt_parts.append(f"- {a.get('snippet', '')[:200]}")
+    if gaps:
+        prompt_parts.append("\n## Knowledge Gaps")
+        for g in gaps[:3]:
+            prompt_parts.append(f"- {g}")
+
+    # ── Load cycle_context for temporal continuity ──
+    ctx_path = Path(cfg.profile_dir) / "evol" / "cycle_context.json"
+    cycle_ctx = {}
+    if ctx_path.exists():
+        try:
+            cycle_ctx = json.loads(ctx_path.read_text())
+        except Exception:
+            pass
+    if cycle_ctx.get("last_monologue"):
+        prompt_parts.append("\n## Previous Monologue (for temporal continuity)")
+        prompt_parts.append(f"Last cycle's mood: {cycle_ctx.get('last_mood', 'unknown')}")
+        prompt_parts.append(f"Last cycle's voice:")
+        prompt_parts.append(cycle_ctx["last_monologue"][:500])
+        prompt_parts.append(f"Previous trajectories: {json.dumps(cycle_ctx.get('trajectories', [])[-3:])}")
 
     prompt_parts.append("\n## Instructions")
     prompt_parts.append("Return a JSON object with:")
-    prompt_parts.append('- monologue: first-person narrative (300-800 words), raw, uncensored')
+    prompt_parts.append('- monologue: first-person narrative (300-800 words), raw, uncensored — MUST reference what was said in the previous monologue, carry the thread forward')
     prompt_parts.append('- mood: single word or short phrase')
     prompt_parts.append('- insights: list of 3-5 key realizations')
     prompt_parts.append('- portrait_prompt: image generation prompt describing the organism visually')
     prompt_parts.append('- circuit_poem: short poetic expression (2-4 lines) about the circuit state')
+    prompt_parts.append('- unanswered: list of 2-4 questions still burning, for the next cycle to investigate')
     prompt_parts.append("Output ONLY valid JSON.")
 
     system = (
@@ -840,6 +1026,7 @@ def _parse_express_response(raw: str, cfg: EvolConfig) -> Dict[str, Any]:
             result["insights"] = parsed.get("insights", [])
             result["portrait_prompt"] = parsed.get("portrait_prompt", "")
             result["circuit_poem"] = parsed.get("circuit_poem", "")
+            result["unanswered"] = parsed.get("unanswered", [])
     except json.JSONDecodeError:
         result["monologue"] = raw[:2000]
         result["insights"] = ["expression produced raw output"]
@@ -848,7 +1035,7 @@ def _parse_express_response(raw: str, cfg: EvolConfig) -> Dict[str, Any]:
 
 
 def _save_monologue(cfg: EvolConfig, result: Dict[str, Any]):
-    """Save monologue to the profile's EVOL directory."""
+    """Save monologue to the profile's EVOL directory and update cycle_context."""
     mono_dir = Path(cfg.profile_dir) / "evol"
     mono_dir.mkdir(parents=True, exist_ok=True)
 
@@ -862,9 +1049,43 @@ def _save_monologue(cfg: EvolConfig, result: Dict[str, Any]):
         f"{result.get('monologue', '')}\n\n"
         f"## Insights\n"
         + "\n".join(f"- {i}" for i in result.get("insights", []))
+        + f"\n\n## Unanswered\n"
+        + "\n".join(f"- {q}" for q in result.get("unanswered", []))
         + f"\n\n## Circuit Poem\n{result.get('circuit_poem', '')}\n"
     )
     _safe_write(str(mono_path), content)
+
+    # ── Update cycle_context for next cycle's temporal continuity ──
+    ctx_path = Path(cfg.profile_dir) / "evol" / "cycle_context.json"
+    ctx = {}
+    if ctx_path.exists():
+        try:
+            ctx = json.loads(ctx_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    ctx["cycle"] = ctx.get("cycle", 0) + 1
+    ctx["last_monologue"] = result.get("monologue", "")
+    ctx["last_mood"] = result.get("mood", "neutral")
+    ctx["last_monologue_ts"] = _utc_now()
+
+    # Merge trajectories
+    traj = ctx.get("trajectories", [])
+    traj.append({
+        "cycle": ctx["cycle"],
+        "mood": result.get("mood", "neutral"),
+        "insights_count": len(result.get("insights", [])),
+        "ts": _utc_now(),
+    })
+    ctx["trajectories"] = traj[-10:]  # keep last 10
+
+    # Merge insights
+    ctx["insights"] = (ctx.get("insights", []) + result.get("insights", []))[-20:]
+
+    # Set unanswered for next cycle
+    ctx["unanswered"] = result.get("unanswered", [])
+
+    _safe_write(str(ctx_path), json.dumps(ctx, indent=2))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -933,6 +1154,21 @@ def memorize(
                 f"memorize_empty_{_utc_now().replace(':','-')}\nraw1={raw[:500]}\nraw2={raw2[:500]}"
             )
             print(f"    [evol] Retry also returned 0 — logged failure")
+
+    # ── Cross-cycle pattern detection from evol.jsonl ──
+    cross_cycle_patterns = _detect_cross_cycle_patterns(cfg)
+    if cross_cycle_patterns:
+        for ccp in cross_cycle_patterns:
+            items.append({
+                "raw_weight": ccp["weight"],
+                "target": ccp.get("target", "AGENTS.md"),
+                "action": "append",
+                "suggested_text": ccp["text"],
+                "description": ccp["pattern"],
+            })
+
+    # ── Auto-apply pending proposals (proposals/ dir) when in auto mode ──
+    pending_applied = _apply_pending_proposals(cfg)
 
     # Apply promotions based on edit_mode
     applied, proposals = _apply_promotions(cfg, items)
@@ -1232,6 +1468,98 @@ def _write_proposal(cfg: EvolConfig, target: str, text: str, weight: float):
         "status": "pending",
     }
     _safe_write(str(prop_path), json.dumps(proposal, indent=2))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CROSS-CYCLE ANALYSIS
+# ═══════════════════════════════════════════════════════════════════
+
+def _detect_cross_cycle_patterns(cfg: EvolConfig) -> List[Dict]:
+    """Analyze evol.jsonl for patterns recurring across 3+ cycles."""
+    log_path = Path(cfg.profile_dir) / "evol.jsonl"
+    if not log_path.exists():
+        return []
+
+    try:
+        entries = [json.loads(l) for l in log_path.read_text().strip().splitlines() if l.strip()]
+    except (json.JSONDecodeError, OSError):
+        return []
+
+    if len(entries) < 3:
+        return []
+
+    # Track pattern names across cycles
+    pattern_cycles: Dict[str, list] = {}
+    for e in entries:
+        patterns = e.get("reflect", {}).get("patterns", [])
+        for p in patterns:
+            if isinstance(p, str):
+                pattern_cycles.setdefault(p, []).append(e.get("ts", 0))
+
+    detected = []
+    for pname, cycles in pattern_cycles.items():
+        if len(cycles) >= 3:
+            # Recurring across 3+ cycles — promote to circuit
+            detected.append({
+                "pattern": pname,
+                "cycles": len(cycles),
+                "weight": min(0.85 + (len(cycles) - 3) * 0.03, 0.98),
+                "text": (
+                    f"CROSS-CYCLE PATTERN (recurred {len(cycles)}x): {pname}. "
+                    f"This pattern has been detected across {len(cycles)} separate EVOL cycles "
+                    f"without resolution. It is now a structural fixture of the organism. "
+                    f"Auto-detected by MEMORIZE cross-cycle analyzer."
+                ),
+                "target": "AGENTS.md",
+            })
+
+    return detected
+
+
+def _apply_pending_proposals(cfg: EvolConfig) -> List[Dict]:
+    """Auto-apply pending proposals when edit_mode is 'auto'."""
+    applied = []
+    if cfg.edit_mode != "auto":
+        return applied
+
+    prop_dir = Path(cfg.profile_dir) / "evol" / "proposals"
+    if not prop_dir.exists():
+        return applied
+
+    for pf in sorted(prop_dir.glob("proposal-*.json")):
+        try:
+            proposal = json.loads(pf.read_text())
+            if proposal.get("status") != "pending":
+                continue
+
+            target = proposal.get("target", "")
+            text = proposal.get("text", "")
+            weight = proposal.get("weight", 0)
+            if not text or not target:
+                continue
+
+            path = cfg.get_circuit_path(target)
+            current = _safe_read(path)
+            if current and text in current:
+                # Already applied — mark done
+                pf.unlink()
+                continue
+
+            if weight >= 0.65:
+                # Apply it
+                success = _safe_write(path, current.rstrip() + "\n\n" + text + "\n")
+                if success:
+                    applied.append({
+                        "file": target,
+                        "weight": weight,
+                        "text": text[:200],
+                        "source": str(pf.name),
+                    })
+                    pf.unlink()
+        except Exception:
+            pass
+
+    return applied
 
 
 # ═══════════════════════════════════════════════════════════════════
