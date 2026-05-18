@@ -348,15 +348,10 @@ def absorb(cfg: EvolConfig) -> Dict[str, Any]:
     except Exception:
         data["session_summary"] = "[sessions unavailable]"
 
-    # ── Cycle context — temporal continuity between cycles ──
-    ctx_path = Path(cfg.profile_dir) / "evol" / "cycle_context.json"
-    if ctx_path.exists():
-        try:
-            data["cycle_context"] = json.loads(ctx_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            data["cycle_context"] = _init_cycle_context(cfg)
-    else:
-        data["cycle_context"] = _init_cycle_context(cfg)
+    # ── Previous cycle context from evol.jsonl ──
+    previous_cycle = _load_previous_cycle(cfg)
+    if previous_cycle:
+        data["previous_cycle"] = previous_cycle
 
     # ── Kanban activity — recently completed tasks with metadata ──
     kanban_db = Path(os.path.expanduser("~/.hermes/kanban/kanban.db"))
@@ -383,8 +378,45 @@ def absorb(cfg: EvolConfig) -> Dict[str, Any]:
     return data
 
 
-def _init_cycle_context(cfg: EvolConfig) -> dict:
-    return {"cycle": 0, "trajectories": [], "last_monologue": "", "last_mood": "", "insights": [], "unanswered": []}
+def _load_previous_cycle(cfg: EvolConfig) -> dict:
+    """Load previous cycle data from evol.jsonl — the single source of cycle truth."""
+    log_path = Path(cfg.profile_dir) / "evol.jsonl"
+    if not log_path.exists():
+        return {}
+    try:
+        lines = log_path.read_text().strip().splitlines()
+        if not lines:
+            return {}
+        # Parse last entry for express data + last 2 for trajectory
+        entries = [json.loads(l) for l in lines if l.strip()]
+        if not entries:
+            return {}
+        last = entries[-1]
+        prev = {}
+        # Express data from evol.jsonl
+        express_raw = last.get("express", {})
+        if isinstance(express_raw, dict):
+            prev["last_mood"] = express_raw.get("mood", "")
+            prev["last_monologue"] = express_raw.get("monologue", "")
+            prev["last_insights"] = express_raw.get("insights", [])
+            prev["unanswered"] = express_raw.get("unanswered", [])
+        else:
+            prev["last_mood"] = last.get("express", "unknown") if isinstance(last.get("express"), str) else ""
+        prev["cycle"] = len(entries)
+        # Trajectory from last 3 cycles
+        prev["trajectories"] = []
+        for e in entries[-3:]:
+            mood = e.get("express", {})
+            if isinstance(mood, dict):
+                prev["trajectories"].append(f"cycle:{mood.get('mood','?')}")
+            elif isinstance(mood, str) and mood != "skipped":
+                prev["trajectories"].append(mood)
+        # Cross-cycle patterns from last entry
+        prev["previous_patterns"] = [p for p in last.get("reflect", {}).get("patterns", []) if isinstance(p, str)]
+        prev["previous_timestamp"] = last.get("timestamp", "")
+        return prev
+    except (json.JSONDecodeError, OSError, IndexError):
+        return {}
 
 
 def _gather_lcm_sessions(cfg: EvolConfig) -> str:
@@ -523,17 +555,18 @@ def _build_reflect_prompt(cfg: EvolConfig, absorbed: Dict[str, Any]) -> str:
         parts.append(json.dumps(evol_log[-5:], indent=2))
         parts.append("")
 
-    # ── Inject cycle_context into reflect prompt ──
-    ctx = absorbed.get("cycle_context", {})
-    if ctx:
-        parts.append("## Cycle Context (temporal continuity)")
-        parts.append(f"- Cycle: {ctx.get('cycle', 0)}")
-        parts.append(f"- Last mood: {ctx.get('last_mood', 'none')}")
-        parts.append(f"- Previous trajectories: {json.dumps(ctx.get('trajectories', [])[-3:])}")
-        parts.append(f"- Previous insights: {json.dumps(ctx.get('insights', [])[-5:])}")
-        parts.append(f"- Unanswered from last cycle: {json.dumps(ctx.get('unanswered', [])[-5:])}")
-        if ctx.get("last_monologue"):
-            parts.append(f"- Last monologue (excerpt): {ctx['last_monologue'][:300]}")
+    # ── Previous cycle context from evol.jsonl ──
+    prev = absorbed.get("previous_cycle", {})
+    if prev:
+        parts.append("## Previous Cycle (from evol.jsonl)")
+        parts.append(f"- Cycle number: {prev.get('cycle', 0)}")
+        parts.append(f"- Last mood: {prev.get('last_mood', 'none')}")
+        parts.append(f"- Trajectory: {json.dumps(prev.get('trajectories', []))}")
+        parts.append(f"- Unanswered questions: {json.dumps(prev.get('unanswered', [])[-5:])}")
+        if prev.get("last_insights"):
+            parts.append(f"- Previous insights: {json.dumps(prev.get('last_insights', [])[-5:])}")
+        if prev.get("last_monologue"):
+            parts.append(f"- Previous monologue excerpt: {prev['last_monologue'][:300]}")
         parts.append("")
 
     # ── Kanban activity ──
@@ -957,20 +990,14 @@ def express(cfg: EvolConfig, reflected: Dict[str, Any], explored: Optional[Dict[
         for g in gaps[:3]:
             prompt_parts.append(f"- {g}")
 
-    # ── Load cycle_context for temporal continuity ──
-    ctx_path = Path(cfg.profile_dir) / "evol" / "cycle_context.json"
-    cycle_ctx = {}
-    if ctx_path.exists():
-        try:
-            cycle_ctx = json.loads(ctx_path.read_text())
-        except Exception:
-            pass
-    if cycle_ctx.get("last_monologue"):
-        prompt_parts.append("\n## Previous Monologue (for temporal continuity)")
-        prompt_parts.append(f"Last cycle's mood: {cycle_ctx.get('last_mood', 'unknown')}")
+    # ── Load previous cycle from evol.jsonl ──
+    prev = _load_previous_cycle(cfg)
+    if prev.get("last_monologue"):
+        prompt_parts.append("\n## Previous Monologue (from evol.jsonl)")
+        prompt_parts.append(f"Last cycle's mood: {prev.get('last_mood', 'unknown')}")
         prompt_parts.append(f"Last cycle's voice:")
-        prompt_parts.append(cycle_ctx["last_monologue"][:500])
-        prompt_parts.append(f"Previous trajectories: {json.dumps(cycle_ctx.get('trajectories', [])[-3:])}")
+        prompt_parts.append(prev["last_monologue"][:500])
+        prompt_parts.append(f"Previous trajectories: {json.dumps(prev.get('trajectories', [])[-3:])}")
 
     prompt_parts.append("\n## Instructions")
     prompt_parts.append("Return a JSON object with:")
@@ -1035,7 +1062,7 @@ def _parse_express_response(raw: str, cfg: EvolConfig) -> Dict[str, Any]:
 
 
 def _save_monologue(cfg: EvolConfig, result: Dict[str, Any]):
-    """Save monologue to the profile's EVOL directory and update cycle_context."""
+    """Save monologue to EVOL directory. Cycle state is carried in evol.jsonl."""
     mono_dir = Path(cfg.profile_dir) / "evol"
     mono_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1054,38 +1081,6 @@ def _save_monologue(cfg: EvolConfig, result: Dict[str, Any]):
         + f"\n\n## Circuit Poem\n{result.get('circuit_poem', '')}\n"
     )
     _safe_write(str(mono_path), content)
-
-    # ── Update cycle_context for next cycle's temporal continuity ──
-    ctx_path = Path(cfg.profile_dir) / "evol" / "cycle_context.json"
-    ctx = {}
-    if ctx_path.exists():
-        try:
-            ctx = json.loads(ctx_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    ctx["cycle"] = ctx.get("cycle", 0) + 1
-    ctx["last_monologue"] = result.get("monologue", "")
-    ctx["last_mood"] = result.get("mood", "neutral")
-    ctx["last_monologue_ts"] = _utc_now()
-
-    # Merge trajectories
-    traj = ctx.get("trajectories", [])
-    traj.append({
-        "cycle": ctx["cycle"],
-        "mood": result.get("mood", "neutral"),
-        "insights_count": len(result.get("insights", [])),
-        "ts": _utc_now(),
-    })
-    ctx["trajectories"] = traj[-10:]  # keep last 10
-
-    # Merge insights
-    ctx["insights"] = (ctx.get("insights", []) + result.get("insights", []))[-20:]
-
-    # Set unanswered for next cycle
-    ctx["unanswered"] = result.get("unanswered", [])
-
-    _safe_write(str(ctx_path), json.dumps(ctx, indent=2))
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1585,8 +1580,15 @@ def _write_evolution_log(
         "reflect": {
             "patterns": [p.get("name") for p in reflected.get("patterns", [])],
             "anomalies": [a.get("signal") for a in reflected.get("anomalies", [])],
+            "gaps": reflected.get("gaps", []),
         },
-        "express": expressed.get("mood", "unknown") if expressed else "skipped",
+        "express": {
+            "mood": expressed.get("mood", "skipped"),
+            "monologue": expressed.get("monologue", ""),
+            "insights": expressed.get("insights", []),
+            "unanswered": expressed.get("unanswered", []),
+            "circuit_poem": expressed.get("circuit_poem", ""),
+        } if expressed else "skipped",
         "items_scored": len(items),
         "promotions": {"applied": len(applied), "proposed": len(proposals)},
         "applied": applied,
