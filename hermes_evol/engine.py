@@ -1,300 +1,424 @@
-"""EVOL Engine — heartbeat, state detection, phase orchestration."""
+"""
+EVOL Engine — Cycle Orchestrator.
 
-import json
-import logging
-import os
-import subprocess
-import threading
+Runs the 5-phase cycle: absorb → reflect → explore → express → memorize.
+Supports profile mode (one profile's data) and global mode (all profiles aggregated).
+
+Also handles:
+  - Phase enable/disable toggles
+  - Per-phase model configuration
+  - Edit mode (auto/suggested/readonly)
+  - Cooldown enforcement
+  - Retry logic (max_retries_per_phase)
+
+Entry point: run_cycle(profile="conductor")
+"""
+
 import time
-from datetime import datetime, timezone
+import json
 from pathlib import Path
-from typing import Any, Optional
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any, List
 
-from .stores import StateStore, MaterialStore, VoiceStore
-from .config import EvolConfig
+# Relative import for plugin context, absolute fallback for standalone testing
+try:
+    from .config import EvolConfig
+    from .registry import absorb, reflect, explore, express, memorize
+    from .registry import _utc_now
+except ImportError:
+    from config import EvolConfig
+    from registry import absorb, reflect, explore, express, memorize
+    from registry import _utc_now
 
-# Phase implementations are loaded lazily from registry
-# to avoid circular imports
-from . import registry as _registry
 
-logger = logging.getLogger(__name__)
+def run_cycle(
+    profile: Optional[str] = None,
+    mode: Optional[str] = None,
+    force: bool = False,
+    skip_phases: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Run a complete EVOL cycle for a profile.
 
+    Args:
+        profile: Profile name (auto-detected if None)
+        mode: "profile" or "global" (from config if None)
+        force: Skip cooldown checks
+        skip_phases: List of phase names to skip (e.g. ["explore", "express"])
 
-class EvolEngine:
-    """Background observer — runs phases based on triggers."""
-
-    def __init__(self, config: EvolConfig):
-        self.cfg = config
-        self.state_store = StateStore(config.state_file)
-        self.material_store = MaterialStore(config.material_file)
-        self.voice_store = VoiceStore(config.voice_file)
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._last_heartbeat: float = 0.0
-        self._cooldowns: dict[str, float] = {}
-        self._manual_trigger: dict[str, float] = {}
-        self._cycle_count: int = 0
-        # Phase enable/disable (all default on)
-        self._absorb_enabled: bool = True
-        self._reflect_enabled: bool = True
-        self._explore_enabled: bool = True
-        self._express_enabled: bool = True
-        self._memorize_enabled: bool = True
-        self._heartbeat_enabled: bool = True
-        # Custom prompts overrides
-        self._custom_prompts: dict[str, str] = {}
-
-    # ── Public tools (return dicts — plugin.py wraps them as JSON strings) ──
-
-    def status(self) -> dict:
-        """Return current organism state and EVOL health."""
-        current = self.state_store.current()
-        idle_sec = current.get("idle_sec", 0) if current else 0
-        return {
-            "engine": "hermes-evol",
-            "version": "0.2.0",
-            "heartbeat_alive": self._running,
-            "state": current.get("state", "UNKNOWN") if current else "UNKNOWN",
-            "idle_seconds": idle_sec,
-            "infra": {
-                "ct_up": current.get("ct_up", 0) if current else 0,
-                "disk_pct": current.get("disk_pct", 0) if current else 0,
-                "gateway_rss_mb": current.get("gw_rss_mb", 0) if current else 0,
-                "providers_healthy": not (current or {}).get("prov_degraded", False),
+    Returns:
+        {
+            "status": "ok" | "skipped" | "error",
+            "profile": str,
+            "mode": str,
+            "phases": {
+                "absorb": {...},
+                "reflect": {...},
+                "explore": {...},
+                "express": {...},
+                "memorize": {...},
             },
-            "material_buffer_size": len(self.material_store.buffer),
-            "last_voice": self._last_voice_ts(),
-            "cooldowns": {
-                k: max(0, v - time.time())
-                for k, v in self._cooldowns.items()
-            },
+            "duration_seconds": float,
+            "error": str if status == "error",
         }
+    """
+    t_start = time.time()
+    skip = set(skip_phases or [])
 
-    def material(self) -> dict:
-        """View accumulated material from absorb phase."""
-        entries = self.material_store.buffer[-50:]
-        return {
-            "entries": entries,
-            "count": len(self.material_store.buffer),
-            "buffer": [e for e in entries],
-        }
-
-    def get_config(self) -> dict:
-        """Show current EVOL configuration."""
-        return {
-            **self.cfg.to_dict(),
-            "phase_state": self._phase_state(),
-        }
-
-    def speak(self, force: bool = False) -> dict:
-        """Trigger EVOL inner voice expression."""
-        if not force and not self._check_cooldown("express"):
-            return {"phase": "express", "blocked": "cooldown"}
-        if not self._express_enabled:
-            return {"phase": "express", "blocked": "disabled"}
-
-        # Collect material for context
-        material = self.material_store.since_last_voice()
-        state = self.state_store.current()
-
-        result = _registry._express_render(self.cfg, material, self.material_store._reflections)
-        self._set_cooldown("express")
-        self._cycle_count += 1
-        return {"phase": "express", "result": result, "cycle": self._cycle_count}
-
-    def reflect(self, force: bool = False) -> dict:
-        """Trigger EVOL reflection on accumulated patterns."""
-        if not force and not self._check_cooldown("reflect"):
-            return {"phase": "reflect", "blocked": "cooldown"}
-        if not self._reflect_enabled:
-            return {"phase": "reflect", "blocked": "disabled"}
-
-        material = self.material_store.buffer
-        state = self.state_store.current()
-
-        # Run fast heuristic first
-        patterns = _registry._process_patterns(self.cfg, material, state)
-        # Then LLM if available
-        llm_result = _registry._process_with_llm(self.cfg, material, state)
-
-        self._set_cooldown("reflect")
-        self.material_store._reflections = [patterns, llm_result]
-        return {
-            "phase": "reflect",
-            "patterns": patterns,
-            "llm_analysis": llm_result,
-        }
-
-    def explore(self, query: Optional[str] = None, force: bool = False) -> dict:
-        """Trigger EVOL knowledge exploration."""
-        if not force and not self._check_cooldown("explore"):
-            return {"phase": "explore", "blocked": "cooldown"}
-        if not self._explore_enabled:
-            return {"phase": "explore", "blocked": "disabled"}
-
-        gaps = self.material_store.get_gaps()
-        if query:
-            result = {
-                "phase": "explore",
-                "manual_query": query,
-                "searches": [_registry._search_searxng(self.cfg, query)],
-            }
-        else:
-            result = _registry._explore_with_llm(
-                self.cfg, gaps, self.state_store.current(), self.material_store
-            )
-
-        self._set_cooldown("explore")
-        return result
-
-    def full_cycle(self, force: bool = False) -> dict:
-        """Run a complete EVOL cycle."""
-        outputs = {}
-        phases = ["reflect", "explore", "express"]
-        for phase in phases:
-            fn = getattr(self, phase, None)
-            if fn:
-                outputs[phase] = fn(force=force)
-        return {"phase": "full_cycle", "outputs": outputs}
-
-    # ── Heartbeat ──
-
-    def start(self):
-        """Start background heartbeat thread."""
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        """Stop background heartbeat thread."""
-        self._running = False
-        if self._thread:
-            self._thread.join(timeout=5)
-
-    def _heartbeat_loop(self):
-        """Probe vitals every heartbeat_interval seconds."""
-        while self._running:
-            try:
-                state = self._probe()
-                self.state_store.append(state)
-                # Absorb new material
-                self._absorb()
-                # Check triggers
-                self._evaluate_triggers()
-            except Exception:
-                logger.exception("Heartbeat tick failed")
-            time.sleep(self.cfg.heartbeat_interval)
-
-    def _probe(self) -> dict:
-        """Probe organism vitals."""
-        return {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "state": "ACTIVE",
-            "idle_sec": 0,
-            "ct_up": 0,
-            "disk_pct": _disk_pct(),
-            "gw_rss_mb": 0,
-            "prov_degraded": False,
-        }
-
-    def _absorb(self):
-        """Collect material from configured sources."""
-        now = time.time()
-        since = now - self.cfg.heartbeat_interval
-
-        for source_cfg in self.cfg.absorb_sources:
-            source_name = source_cfg.get("name", "")
-            collector = _registry.SOURCES.get(source_name)
-            if collector:
-                try:
-                    entries = collector(source_cfg, since)
-                    for entry in entries:
-                        self.material_store.append(entry)
-                except Exception:
-                    logger.exception("Absorb source %s failed", source_name)
-
-        # Trim old entries
-        if len(self.material_store.buffer) > self.cfg.material_retention:
-            self.material_store.buffer = self.material_store.buffer[
-                -self.cfg.material_retention:
-            ]
-
-    def _evaluate_triggers(self):
-        """Check if any phase should fire."""
-        state = self.state_store.current()
-        material = self.material_store
-
-        # Reflect trigger check
-        for trigger_cfg in self.cfg.reflect_triggers:
-            trigger_name = trigger_cfg.get("name", "")
-            trigger_fn = _registry.TRIGGERS.get(trigger_name)
-            if trigger_fn and trigger_fn(self.cfg, state, material):
-                if self._check_cooldown("reflect"):
-                    self.reflect()
-                    break
-
-        # Express trigger check
-        for trigger_cfg in self.cfg.express_triggers:
-            trigger_name = trigger_cfg.get("name", "")
-            trigger_fn = _registry.TRIGGERS.get(trigger_name)
-            if trigger_fn and trigger_fn(self.cfg, state, material):
-                if self._check_cooldown("express"):
-                    self.speak()
-                    break
-
-    def _last_voice_ts(self) -> Optional[str]:
-        """Timestamp of last voice expression."""
-        last = self.voice_store.last_voice()
-        if last:
-            return last.get("ts")
-        return None
-
-    def _check_cooldown(self, phase: str) -> bool:
-        """Check if phase is off cooldown. Returns True if ready."""
-        cooldown_hours = getattr(self.cfg, f"{phase}_cooldown_hours", 4)
-        last = self._cooldowns.get(phase, 0)
-        return (time.time() - last) > (cooldown_hours * 3600)
-
-    def _set_cooldown(self, phase: str):
-        """Reset cooldown timer for a phase."""
-        self._cooldowns[phase] = time.time()
-
-    def _phase_state(self) -> dict:
-        return {
-            "absorb": self._absorb_enabled,
-            "reflect": self._reflect_enabled,
-            "explore": self._explore_enabled,
-            "express": self._express_enabled,
-            "memorize": self._memorize_enabled,
-            "heartbeat": self._heartbeat_enabled,
-            "custom_prompts": list(self._custom_prompts.keys()),
-        }
-
-    def _get_prompts(self) -> dict:
-        """Return current prompts (defaults + custom overrides)."""
-        defaults = {
-            "absorb": "Default absorb",
-            "reflect": "Default reflect",
-            "explore": "Default explore",
-            "express": "Default express",
-            "memorize": "Default memorize",
-        }
-        defaults.update(self._custom_prompts)
-        return defaults
-
-
-def _disk_pct() -> int:
-    """Return disk usage percentage."""
+    # ── Load config ──
     try:
-        result = subprocess.run(
-            ["df", "--output=pcent", "/"], capture_output=True, text=True, timeout=5
-        )
-        lines = result.stdout.strip().split("\n")
-        if len(lines) >= 2:
-            pct = lines[1].strip().rstrip("%")
-            return int(pct) if pct.isdigit() else 0
-    except Exception:
+        cfg = EvolConfig(profile=profile, mode=mode)
+    except Exception as e:
+        return {"status": "error", "profile": profile or "unknown", "error": f"Config load failed: {e}"}
+
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "profile": cfg.profile,
+        "mode": cfg.mode,
+        "phases": {},
+        "duration_seconds": 0,
+    }
+
+    # ── Quick checks ──
+    if not cfg.enabled:
+        return {**result, "status": "skipped", "reason": "EVOL disabled"}
+
+    if not force and not _should_run(cfg):
+        return {**result, "status": "skipped", "reason": "cooldown"}
+
+    # ═══════════════════════════════════════════════════════════
+    # GATHER SIDE: absorb → reflect → explore
+    # ═══════════════════════════════════════════════════════════
+
+    # ── PHASE 1: ABSORB (profile: 1 call, global: absorb all profiles → merge) ──
+    if "absorb" not in skip and cfg.is_phase_enabled("absorb"):
+        try:
+            if cfg.mode == "global":
+                absorbed = _absorb_global(cfg)
+            else:
+                absorbed = _run_with_retry(absorb, cfg, "absorb")
+            result["phases"]["absorb"] = {"status": "ok", "sources_count": len(absorbed.get("circuit_files", {})), "data": absorbed}
+        except Exception as e:
+            result["phases"]["absorb"] = {"status": "error", "error": str(e)}
+            return {**result, "status": "error", "error": f"absorb failed: {e}"}
+    else:
+        absorbed = {"profile": cfg.profile, "mode": cfg.mode, "circuit_files": {}, "session_summary": ""}
+        result["phases"]["absorb"] = {"status": "skipped"}
+
+    # ── PHASE 2: REFLECT ──
+    if "reflect" not in skip and cfg.is_phase_enabled("reflect"):
+        try:
+            reflected = _run_with_retry(reflect, cfg, absorbed, "reflect")
+            result["phases"]["reflect"] = {
+                "status": "ok",
+                "patterns": len(reflected.get("patterns", [])),
+                "anomalies": len(reflected.get("anomalies", [])),
+                "bridge_signals": len(reflected.get("bridge_signals", [])),
+                "data": reflected,
+            }
+        except Exception as e:
+            result["phases"]["reflect"] = {"status": "error", "error": str(e)}
+            reflected = {"patterns": [], "anomalies": [], "bridge_signals": [], "circuit_health": {}}
+    else:
+        reflected = {"patterns": [], "anomalies": [], "bridge_signals": [], "circuit_health": {}}
+        result["phases"]["reflect"] = {"status": "skipped"}
+
+    # ── PHASE 3: EXPLORE ──
+    if "explore" not in skip and cfg.is_phase_enabled("explore"):
+        try:
+            explored = _run_with_retry(explore, cfg, reflected, "explore")
+            result["phases"]["explore"] = {
+                "status": "ok",
+                "queries": explored.get("queries", []),
+                "discoveries": len(explored.get("discoveries", [])),
+                "data": explored,
+            }
+        except Exception as e:
+            result["phases"]["explore"] = {"status": "error", "error": str(e)}
+            explored = {"queries": [], "results": [], "discoveries": []}
+    else:
+        explored = {"queries": [], "results": [], "discoveries": []}
+        result["phases"]["explore"] = {"status": "skipped"}
+
+    # ═══════════════════════════════════════════════════════════
+    # OUTPUT SIDE: express → memorize
+    # ═══════════════════════════════════════════════════════════
+
+    # ── PHASE 4: EXPRESS ──
+    if "express" not in skip and cfg.is_phase_enabled("express"):
+        if not _express_can_run(cfg):
+            result["phases"]["express"] = {"status": "skipped", "reason": "cooldown"}
+            expressed = None
+        else:
+            try:
+                expressed = _run_with_retry(express, cfg, reflected, explored, "express")
+                result["phases"]["express"] = {
+                    "status": "ok",
+                    "mood": expressed.get("mood", "unknown"),
+                    "insights": len(expressed.get("insights", [])),
+                    "data": expressed,
+                }
+                # Update last express timestamp
+                _touch_last_express(cfg)
+            except Exception as e:
+                result["phases"]["express"] = {"status": "error", "error": str(e)}
+                expressed = None
+    else:
+        expressed = None
+        result["phases"]["express"] = {"status": "skipped"}
+
+    # ── PHASE 5: MEMORIZE ──
+    if "memorize" not in skip and cfg.is_phase_enabled("memorize"):
+        try:
+            memorized = _run_with_retry(memorize, cfg, reflected, expressed, explored, "memorize")
+            result["phases"]["memorize"] = {
+                "status": "ok",
+                "items_scored": len(memorized.get("items", [])),
+                "applied": len(memorized.get("applied", [])),
+                "proposed": len(memorized.get("proposals", [])),
+                "data": memorized,
+            }
+        except Exception as e:
+            result["phases"]["memorize"] = {"status": "error", "error": str(e)}
+    else:
+        result["phases"]["memorize"] = {"status": "skipped"}
+
+    # ── Finalize ──
+    _touch_last_cycle(cfg)
+    result["duration_seconds"] = round(time.time() - t_start, 2)
+
+    return result
+
+
+def _absorb_global(cfg: EvolConfig) -> Dict[str, Any]:
+    """Absorb ALL profiles and merge into one combined context.
+    Single LLM call per phase, not per profile. 5 calls total for a global cycle."""
+    profiles = cfg.global_profiles or cfg._discover_profiles()
+    combined: Dict[str, Any] = {
+        "profile": "global",
+        "mode": "global",
+        "timestamp": _utc_now(),
+        "circuit_files": {},
+        "session_summary": "",
+        "evolution_log": [],
+        "gateway_log_tail": "",
+        "profiles_absorbed": [],
+    }
+    for prof in profiles:
+        try:
+            pc = EvolConfig(profile=prof)
+            pc.search_backend = cfg.search_backend  # inherit
+            a = absorb(pc)
+            for fn, content in a.get("circuit_files", {}).items():
+                combined["circuit_files"][f"{prof}/{fn}"] = content
+            if a.get("session_summary"):
+                combined["session_summary"] += f"\n[{prof}] {a['session_summary'][:300]}"
+            combined["evolution_log"].extend(a.get("evolution_log", [])[-5:])
+            combined["profiles_absorbed"].append(prof)
+        except Exception:
+            pass
+    return combined
+
+
+# ═══════════════════════════════════════════════════════════════════
+# HELPERS
+# ═══════════════════════════════════════════════════════════════════
+
+def _run_with_retry(phase_fn, cfg: EvolConfig, *args, phase_name: str, **kwargs) -> Any:
+    """Run a phase function with retry logic."""
+    last_error = None
+    for attempt in range(cfg.max_retries_per_phase):
+        try:
+            return phase_fn(cfg, *args, **kwargs)
+        except Exception as e:
+            last_error = e
+            if attempt < cfg.max_retries_per_phase - 1:
+                time.sleep(2 ** attempt)  # exponential backoff
+    raise last_error  # type: ignore
+
+
+def _should_run(cfg: EvolConfig) -> bool:
+    """Check if enough time has passed since the last cycle."""
+    marker = Path(cfg.profile_dir) / "evol" / ".last_cycle"
+    if not marker.exists():
+        return True
+
+    try:
+        last = float(marker.read_text().strip())
+        elapsed = (time.time() - last) / 60  # minutes
+        return elapsed >= cfg.cooldown_minutes
+    except (ValueError, OSError):
+        return True
+
+
+def _express_can_run(cfg: EvolConfig) -> bool:
+    """Check express cooldown."""
+    marker = Path(cfg.profile_dir) / "evol" / ".last_express"
+    if not marker.exists():
+        return True
+
+    try:
+        last = float(marker.read_text().strip())
+        elapsed = (time.time() - last) / 3600  # hours
+        return elapsed >= cfg.express_cooldown_hours
+    except (ValueError, OSError):
+        return True
+
+
+def _touch_last_cycle(cfg: EvolConfig):
+    """Update the last cycle timestamp."""
+    marker = Path(cfg.profile_dir) / "evol" / ".last_cycle"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        marker.write_text(str(time.time()))
+    except OSError:
         pass
-    return 0
+
+
+def _touch_last_express(cfg: EvolConfig):
+    """Update the last express timestamp."""
+    marker = Path(cfg.profile_dir) / "evol" / ".last_express"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        marker.write_text(str(time.time()))
+    except OSError:
+        pass
+
+
+def disable(cfg=None):
+    """Disable EVOL for a profile."""
+    if cfg is None:
+        cfg = EvolConfig()
+    cfg.enabled = False
+    cfg.save()
+    return {"status": "ok", "profile": cfg.profile, "enabled": False}
+
+
+def enable(cfg=None):
+    """Enable EVOL for a profile."""
+    if cfg is None:
+        cfg = EvolConfig()
+    cfg.enabled = True
+    cfg.save()
+    return {"status": "ok", "profile": cfg.profile, "enabled": True}
+
+
+def set_edit_mode(mode: str, cfg=None):
+    """Set edit mode: auto, suggested, or readonly."""
+    if cfg is None:
+        cfg = EvolConfig()
+    if mode not in ("auto", "suggested", "readonly"):
+        return {"status": "error", "error": f"Invalid mode: {mode}"}
+    cfg.edit_mode = mode  # type: ignore
+    cfg.save()
+    return {"status": "ok", "profile": cfg.profile, "edit_mode": mode}
+
+
+def set_phase_model(phase: str, provider: str = "", model: str = "", api_key: str = ""):
+    """Configure model for a specific phase."""
+    cfg = EvolConfig()
+    if phase not in cfg.phase_models:
+        return {"status": "error", "error": f"Unknown phase: {phase}"}
+    pm = cfg.phase_models[phase]
+    if provider:
+        pm.provider = provider
+    if model:
+        pm.model = model
+    if api_key:
+        pm.api_key = api_key
+    cfg.save()
+    return {"status": "ok", "phase": phase, "provider": pm.provider, "model": pm.model}
+
+
+def reset(profile: Optional[str] = None, clear_knowledge: bool = False, clear_history: bool = False) -> Dict[str, Any]:
+    """Reset EVOL state for a profile — clean start from zero.
+    
+    Args:
+        profile: Profile name (auto-detected if None)
+        clear_knowledge: Also wipe ~/.hermes/knowledge/ (shared across profiles!)
+        clear_history: Also wipe evol.jsonl and evol/proposals/
+    
+    Returns:
+        {status, profile, wiped: [list of what was deleted]}
+    """
+    import shutil
+    cfg = EvolConfig(profile=profile)
+    wiped = []
+    
+    profile_dir = Path(cfg.profile_dir)
+    evol_dir = profile_dir / "evol"
+    
+    # 1. Reset evol.json to defaults
+    config_path = evol_dir / "evol.json"
+    if config_path.exists():
+        config_path.unlink()
+        wiped.append(str(config_path))
+    
+    # Always wipe these markers
+    for marker in [".last_cycle", ".last_express"]:
+        mp = evol_dir / marker
+        if mp.exists():
+            mp.unlink()
+            wiped.append(str(mp))
+    
+    # 2. Optionally clear cycle history
+    if clear_history:
+        log_path = profile_dir / "evol.jsonl"
+        if log_path.exists():
+            log_path.unlink()
+            wiped.append(str(log_path))
+        
+        proposals_dir = evol_dir / "proposals"
+        if proposals_dir.exists():
+            shutil.rmtree(str(proposals_dir))
+            wiped.append(str(proposals_dir))
+    
+    # 3. Optionally clear shared knowledge (DANGER ZONE)
+    if clear_knowledge:
+        kd = Path(os.path.expanduser("~/.hermes/knowledge"))
+        if kd.exists():
+            shutil.rmtree(str(kd))
+            kd.mkdir(parents=True, exist_ok=True)
+            wiped.append(str(kd) + " (ALL PROFILES)")
+    
+    # Regenerate fresh config
+    fresh_cfg = EvolConfig(profile=cfg.profile)
+    fresh_cfg.profile_dir = str(profile_dir)  # preserve explicit dir
+    fresh_cfg.save()
+    
+    return {
+        "status": "ok",
+        "profile": cfg.profile,
+        "wiped": wiped,
+        "note": "EVOL reset to defaults. Will auto-detect provider/model from Hermes config on next cycle.",
+    }
+
+
+def status(profile: Optional[str] = None) -> Dict[str, Any]:
+    """Get EVOL status for a profile."""
+    cfg = EvolConfig(profile=profile)
+    last_cycle_path = Path(cfg.profile_dir) / "evol" / ".last_cycle"
+    last_express_path = Path(cfg.profile_dir) / "evol" / ".last_express"
+
+    def _read_ts(p: Path) -> Optional[str]:
+        try:
+            ts = float(p.read_text().strip())
+            return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+        except (ValueError, OSError):
+            return None
+
+    return {
+        "profile": cfg.profile,
+        "mode": cfg.mode,
+        "enabled": cfg.enabled,
+        "edit_mode": cfg.edit_mode,
+        "phases": cfg.phase_enabled,
+        "phase_models": {
+            phase: {"provider": pm.provider or "hermes-default", "model": pm.model or "default"}
+            for phase, pm in cfg.phase_models.items()
+        },
+        "cooldown": f"{cfg.cooldown_minutes}min",
+        "express_cooldown": f"{cfg.express_cooldown_hours}h",
+        "last_cycle": _read_ts(last_cycle_path),
+        "last_express": _read_ts(last_express_path),
+    }
