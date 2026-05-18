@@ -50,6 +50,8 @@ def _wrap(fn):
         # Hermes dispatch: handler({"force": True}) — positional dict
         if args and isinstance(args[0], dict) and not kwargs:
             kwargs = args[0]
+        # Hermes injects task_id and other internal kwargs — filter them out
+        kwargs = {k: v for k, v in kwargs.items() if k not in ('task_id', 'session_id', 'actor_id')}
         result = fn(**kwargs) if kwargs else fn()
         if isinstance(result, str):
             return result
