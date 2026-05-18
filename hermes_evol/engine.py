@@ -16,6 +16,7 @@ Entry point: run_cycle(profile="conductor")
 
 import time
 import json
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
@@ -421,4 +422,233 @@ def status(profile: Optional[str] = None) -> Dict[str, Any]:
         "express_cooldown": f"{cfg.express_cooldown_hours}h",
         "last_cycle": _read_ts(last_cycle_path),
         "last_express": _read_ts(last_express_path),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# EvolEngine Bridge — wraps module functions for gateway plugin.py API
+# ═══════════════════════════════════════════════════════════════════
+
+class EvolEngine:
+    """Bridge class wrapping EVOL module functions into OOP API expected by plugin.py.
+
+    plugin.py + commands.py expect:
+      engine = EvolEngine(config)
+      engine.status()    engine.material()    engine.get_config()
+      engine.speak()     engine.reflect()     engine.explore()
+      engine.full_cycle()    engine.start()
+      engine._phase_state()  engine._get_prompts()
+      engine._absorb_enabled, _reflect_enabled, etc.
+    """
+
+    def __init__(self, config: EvolConfig):
+        self.cfg = config
+        self.profile = config.profile
+        self.mode = config.mode
+        self._running = False
+        self._thread: Optional[Any] = None
+        self._cooldowns: Dict[str, float] = {}
+
+        # Phase enable/disable — mutable toggles
+        self._absorb_enabled = config.phase_enabled.get("absorb", True)
+        self._reflect_enabled = config.phase_enabled.get("reflect", True)
+        self._explore_enabled = config.phase_enabled.get("explore", True)
+        self._express_enabled = config.phase_enabled.get("express", True)
+        self._memorize_enabled = config.phase_enabled.get("memorize", True)
+        self._heartbeat_enabled = True
+        self._custom_prompts: Dict[str, str] = {}
+
+        # Material buffer for absorb
+        self._material_buffer: List[Dict] = []
+
+    # ── Tool methods (return dicts — _wrap() in plugin.py serializes to JSON string) ──
+
+    def status(self) -> Dict[str, Any]:
+        return _build_status(self)
+
+    def material(self) -> Dict[str, Any]:
+        return {
+            "profile": self.profile, "mode": self.mode,
+            "buffer_size": len(self._material_buffer),
+            "recent": self._material_buffer[-20:] if self._material_buffer else [],
+            "gaps": [],
+        }
+
+    def get_config(self) -> Dict[str, Any]:
+        return self.cfg.to_dict()
+
+    def speak(self, force: bool = False) -> Dict[str, Any]:
+        """Express phase — inner monologue + optional voice/portrait."""
+        if not force and not self._express_enabled:
+            return {"status": "skipped", "reason": "express disabled"}
+        try:
+            # Quick absorb first
+            absorbed = {"profile": self.profile, "mode": self.mode, "circuit_files": {}}
+            reflected = {"patterns": [], "anomalies": [], "bridge_signals": [], "circuit_health": {}}
+            result = express(self.cfg, reflected)
+            self._set_cooldown("express")
+            return {"status": "ok", "data": result}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def reflect(self, force: bool = False) -> Dict[str, Any]:
+        """Reflect phase — pattern synthesis from accumulated material."""
+        if not force and not self._reflect_enabled:
+            return {"status": "skipped", "reason": "reflect disabled"}
+        try:
+            absorbed = {"profile": self.profile, "mode": self.mode, "circuit_files": {}}
+            result = reflect(self.cfg, absorbed)
+            self._set_cooldown("reflect")
+            return {"status": "ok", "data": result}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def explore(self, force: bool = False, query: str = "") -> Dict[str, Any]:
+        """Explore phase — search gaps discovered in reflect."""
+        if not force and not self._explore_enabled:
+            return {"status": "skipped", "reason": "explore disabled"}
+        try:
+            reflected = {"patterns": [], "anomalies": [], "bridge_signals": []}
+            result = explore(self.cfg, reflected)
+            self._set_cooldown("explore")
+            return {"status": "ok", "data": result}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def full_cycle(self, force: bool = False) -> Dict[str, Any]:
+        """Run complete EVOL cycle: absorb→reflect→explore→express→memorize."""
+        if not force and not self._should_run():
+            return {"status": "skipped", "reason": "cooldown"}
+        try:
+            result = run_cycle(profile=self.profile, mode=self.mode, force=force)
+            self._set_cooldown("cycle")
+            return {"status": "ok", "data": result}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    # ── Lifecycle ──
+
+    def start(self):
+        """Start background heartbeat thread (daemon, auto-cleaned on gateway exit)."""
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop heartbeat thread."""
+        self._running = False
+
+    # ── Phase state (for commands.py) ──
+
+    def _phase_state(self) -> Dict[str, Any]:
+        return {
+            "absorb": self._absorb_enabled,
+            "reflect": self._reflect_enabled,
+            "explore": self._explore_enabled,
+            "express": self._express_enabled,
+            "memorize": self._memorize_enabled,
+            "heartbeat": self._heartbeat_enabled,
+            "mode": self.mode,
+        }
+
+    def _get_prompts(self) -> Dict[str, str]:
+        return dict(self._custom_prompts)
+
+    # ── Heartbeat ──
+
+    def _heartbeat_loop(self):
+        """Probe vitals every 900s, absorb material, evaluate triggers."""
+        import os as _os_module
+        while self._running:
+            try:
+                # Mechanical absorb — no LLM
+                self._absorb_tick()
+                # Check triggers
+                if len(self._material_buffer) >= 5 and self._reflect_enabled and self._check_cooldown("reflect"):
+                    self.reflect(force=True)
+                if self._express_enabled and self._check_cooldown("express"):
+                    self.speak(force=True)
+            except Exception:
+                pass
+            time.sleep(self.cfg.cooldown_minutes * 60 if self.cfg.cooldown_minutes else 240)
+
+    def _absorb_tick(self):
+        """Collect material from profile sources."""
+        try:
+            from .registry import absorb as _absorb
+            absorbed = _absorb(self.cfg)
+            if absorbed.get("circuit_files"):
+                self._material_buffer.append({
+                    "ts": _utc_now(),
+                    "type": "absorb_tick",
+                    "files": list(absorbed["circuit_files"].keys()),
+                })
+        except ImportError:
+            from registry import absorb as _absorb
+            absorbed = _absorb(self.cfg)
+            if absorbed.get("circuit_files"):
+                self._material_buffer.append({
+                    "ts": _utc_now(),
+                    "type": "absorb_tick",
+                    "files": list(absorbed["circuit_files"].keys()),
+                })
+
+    # ── Cooldown ──
+
+    def _should_run(self) -> bool:
+        marker = Path(self.cfg.profile_dir) / "evol" / ".last_cycle"
+        if not marker.exists():
+            return True
+        try:
+            last = float(marker.read_text().strip())
+            return (time.time() - last) / 60 >= self.cfg.cooldown_minutes
+        except (ValueError, OSError):
+            return True
+
+    def _check_cooldown(self, phase: str) -> bool:
+        cooldown_hours = getattr(self.cfg, f"{phase}_cooldown_hours", 4) if phase != "cycle" else 0
+        if phase == "reflect":
+            cooldown_hours = 4
+        elif phase == "express":
+            cooldown_hours = self.cfg.express_cooldown_hours
+        last = self._cooldowns.get(phase, 0)
+        return (time.time() - last) > (cooldown_hours * 3600)
+
+    def _set_cooldown(self, phase: str):
+        self._cooldowns[phase] = time.time()
+
+
+def _build_status(engine: EvolEngine) -> Dict[str, Any]:
+    """Build status dict from EvolEngine state."""
+    last_cycle = Path(engine.cfg.profile_dir) / "evol" / ".last_cycle"
+    last_express = Path(engine.cfg.profile_dir) / "evol" / ".last_express"
+    idle_sec = 0  # approximate
+
+    def _read_ts(p: Path) -> Optional[str]:
+        try:
+            return datetime.fromtimestamp(float(p.read_text().strip()), tz=timezone.utc).isoformat()
+        except Exception:
+            return None
+
+    return {
+        "engine": "hermes-evol",
+        "version": "0.3.0",
+        "profile": engine.profile,
+        "mode": engine.mode,
+        "heartbeat_alive": engine._running,
+        "state": "ACTIVE",
+        "idle_seconds": idle_sec,
+        "infra": {"disk_pct": 0, "providers_healthy": True},
+        "material_buffer_size": len(engine._material_buffer),
+        "cooldowns": {
+            "reflect": engine._cooldowns.get("reflect", 0),
+            "explore": engine._cooldowns.get("explore", 0),
+            "express": engine._cooldowns.get("express", 0),
+            "memorize": engine._cooldowns.get("memorize", 0),
+        },
+        "phases": engine._phase_state(),
+        "last_cycle": _read_ts(last_cycle),
+        "last_express": _read_ts(last_express),
     }

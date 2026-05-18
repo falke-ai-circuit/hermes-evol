@@ -577,6 +577,11 @@ class EvolConfig:
         """Save current config to evol.json."""
         self._save_to_file()
 
+    @classmethod
+    def from_env(cls) -> "EvolConfig":
+        """Create EvolConfig from environment — auto-detects profile, reads config files, applies env overrides."""
+        return cls()
+
     def __repr__(self) -> str:
         return (
             f"EvolConfig(profile={self.profile!r}, mode={self.mode!r}, "
