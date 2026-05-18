@@ -314,12 +314,20 @@ def absorb(cfg: EvolConfig) -> Dict[str, Any]:
         "profile_metadata": {},
     }
 
+    # ── Idle depth: how much deeper to go based on inactivity ──
+    idle = _compute_idle_depth(cfg)
+    data["idle_depth"] = idle
+    session_depth = idle["session_depth"]
+    file_char_limit = idle["file_char_limit"]
+    evol_entries_to_load = idle["evol_entries"]
+    gateway_lines = idle["gateway_lines"]
+
     # ── Circuit files ──
     for fname in ["SOUL.md", "AGENTS.md", "MEMORY.md", "IDENTITY.md"]:
         path = cfg.get_circuit_path(fname)
         content = _safe_read(path)
         if content:
-            trunc = content[:6000] if len(content) > 6000 else content
+            trunc = content[:file_char_limit] if len(content) > file_char_limit else content
             data["circuit_files"][fname] = trunc
 
     # ── Gateway log tail ──
@@ -328,7 +336,7 @@ def absorb(cfg: EvolConfig) -> Dict[str, Any]:
         raw = _safe_read(log_path)
         if raw:
             lines = raw.splitlines()
-            data["gateway_log_tail"] = "\n".join(lines[-200:])
+            data["gateway_log_tail"] = "\n".join(lines[-gateway_lines:])
 
     # ── Evolution log ──
     evol_log = Path(cfg.profile_dir) / "evol.jsonl"
@@ -336,15 +344,15 @@ def absorb(cfg: EvolConfig) -> Dict[str, Any]:
         try:
             entries = evol_log.read_text().strip().splitlines()
             data["evolution_log"] = [
-                json.loads(line) for line in entries[-20:]
+                json.loads(line) for line in entries[-evol_entries_to_load:]
                 if line.strip()
             ]
         except (OSError, json.JSONDecodeError):
             pass
 
-    # ── LCM session summary — real user messages from JSONL files ──
+    # ── LCM session summary — real user messages, idle-scaled depth ──
     try:
-        data["session_summary"] = _gather_lcm_sessions(cfg)
+        data["session_summary"] = _gather_lcm_sessions(cfg, depth=session_depth)
     except Exception:
         data["session_summary"] = "[sessions unavailable]"
 
@@ -419,8 +427,69 @@ def _load_previous_cycle(cfg: EvolConfig) -> dict:
         return {}
 
 
-def _gather_lcm_sessions(cfg: EvolConfig) -> str:
-    """Gather recent session context from JSONL session files — real user messages, topics, themes."""
+def _compute_idle_depth(cfg: EvolConfig) -> dict:
+    """Compute how deep ABSORB should go based on time since last cycle.
+    
+    When Goran is away, the organism gets hungry — it goes deeper into history.
+    Different perspective on old data + changed identity/soul = different memorization.
+    """
+    marker = Path(cfg.profile_dir) / "evol" / ".last_cycle"
+    hours_idle = 0
+    if marker.exists():
+        try:
+            hours_idle = (time.time() - float(marker.read_text().strip())) / 3600
+        except Exception:
+            pass
+
+    # Default (fresh, <4h idle)
+    depth = {
+        "session_depth": 3,
+        "file_char_limit": 6000,
+        "evol_entries": 20,
+        "gateway_lines": 200,
+        "hours_idle": round(hours_idle, 1),
+    }
+
+    if hours_idle < 4:
+        return depth
+
+    # 4-12h: moderate hunger — more sessions, more evol history
+    if hours_idle < 12:
+        depth["session_depth"] = 6
+        depth["file_char_limit"] = 8000
+        depth["evol_entries"] = 40
+        depth["gateway_lines"] = 400
+        return depth
+
+    # 12-24h: getting hungry — deeper dive into old sessions
+    if hours_idle < 24:
+        depth["session_depth"] = 10
+        depth["file_char_limit"] = 10000
+        depth["evol_entries"] = 60
+        depth["gateway_lines"] = 600
+        return depth
+
+    # 24-72h: starved — full circuit files, extensive session archaeology
+    if hours_idle < 72:
+        depth["session_depth"] = 20
+        depth["file_char_limit"] = 16000
+        depth["evol_entries"] = 100
+        depth["gateway_lines"] = 1000
+        return depth
+
+    # >72h: feral — load everything, no truncation
+    depth["session_depth"] = 50
+    depth["file_char_limit"] = 50000
+    depth["evol_entries"] = 200
+    depth["gateway_lines"] = 3000
+    return depth
+
+
+def _gather_lcm_sessions(cfg: EvolConfig, depth: int = 3) -> str:
+    """Gather recent session context from JSONL session files — real user messages, topics, themes.
+    
+    depth: number of session files to scan (higher when organism has been idle longer)
+    """
     sessions_dir = Path(cfg.profile_dir) / "sessions"
     if not sessions_dir.exists():
         return "[no sessions directory]"
@@ -430,7 +499,7 @@ def _gather_lcm_sessions(cfg: EvolConfig) -> str:
         return "[no session files]"
 
     parts = []
-    for sf in jsonl_files[:3]:
+    for sf in jsonl_files[:depth]:
         try:
             lines = sf.read_text().splitlines()
             user_msgs = []

@@ -1,0 +1,86 @@
+{
+  "project": "hermes-evol",
+  "version": "0.4.1",
+  "updated": "2026-05-18",
+
+  "hot_cache": {
+    "providers": {
+      "ollama-cloud": {"base_url": "https://ollama.com/v1", "key_env": "OLLAMA_API_KEY", "default_model": "deepseek-v4-pro"},
+      "venice": {"base_url": "https://api.venice.ai/api/v1", "key_env": "VENICE_API_KEY", "default_model": "deepseek-v4-pro"},
+      "duckduckgo": {"url": "https://api.duckduckgo.com", "free": true},
+      "arxiv": {"url": "http://export.arxiv.org/api/query", "free": true}
+    },
+    "phase_model_map": {
+      "reflect": "ollama-cloud/deepseek-v4-pro",
+      "explore": "ollama-cloud/deepseek-v4-pro + DuckDuckGo/arXiv",
+      "express": "venice/deepseek-v4-pro",
+      "memorize": "ollama-cloud/deepseek-v4-pro"
+    },
+    "max_tokens": {"deepseek-v4-pro": 8192, "venice": 4096},
+    "retries": 9,
+    "heartbeat_interval": 900,
+    "three_tier_thresholds": {
+      "promote_knowledge_to_memory": 0.65,
+      "promote_memory_to_circuit": 0.85,
+      "demote_circuit_to_memory": 0.50,
+      "demote_memory_to_knowledge": 0.40,
+      "phase_out": 0.15
+    }
+  },
+
+  "gotchas": [
+    {
+      "name": "pycache-silences-edits",
+      "severity": "critical",
+      "pattern": "Source changes have no effect after gateway restart",
+      "fix": "rm -rf hermes_evol/__pycache__/ before restart",
+      "detection": "Compare .py mtime vs .pyc mtime"
+    },
+    {
+      "name": "venice-glm-heretic-thinking",
+      "severity": "high",
+      "pattern": "GLM heretic returns empty content, all output in reasoning_content",
+      "fix": "Use deepseek-v4-pro for EXPRESS, not GLM variant",
+      "detection": "Check content field empty + reasoning_content populated"
+    },
+    {
+      "name": "plugin-loads-from-profile-dir",
+      "severity": "medium",
+      "pattern": "Plugin not found after copying to global plugins/",
+      "fix": "Plugin lives in profiles/<name>/plugins/hermes-evol/, not global",
+      "detection": "gateway.log shows no 'hermes-evol registering'"
+    },
+    {
+      "name": "gateway-contention-kills-memorize",
+      "severity": "high",
+      "pattern": "MEMORIZE returns 0 items after successful REFLECT",
+      "fix": "Built-in 30s cooldown retry in memorize(), 3rd fallback to Venice",
+      "detection": "memorize_failed.txt written in evol/ directory"
+    },
+    {
+      "name": "old-evol-entries-string-format",
+      "severity": "low",
+      "pattern": "evol.jsonl entries pre-v0.4.0 use string for 'express' field",
+      "fix": "_load_previous_cycle() handles both dict and string formats",
+      "detection": "TypeError reading express field"
+    }
+  ],
+
+  "domain_index": {
+    "registry.py": ["evol", "plugin-dev"],
+    "engine.py": ["evol", "plugin-dev"],
+    "config.py": ["evol", "openclaw-model-config"],
+    "knowledge.py": ["memory", "evol"],
+    "plugin.py": ["hermes-agent", "evol"],
+    "commands.py": ["hermes-agent"]
+  },
+
+  "file_sizes": {
+    "registry.py": "~1600 lines",
+    "engine.py": "~700 lines",
+    "config.py": "~585 lines",
+    "knowledge.py": "~535 lines",
+    "plugin.py": "~182 lines",
+    "commands.py": "~89 lines"
+  }
+}

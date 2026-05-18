@@ -16,6 +16,7 @@ Entry point: run_cycle(profile="conductor")
 
 import time
 import json
+import os
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
@@ -559,20 +560,82 @@ class EvolEngine:
     # ── Heartbeat ──
 
     def _heartbeat_loop(self):
-        """Probe vitals every 900s, absorb material, evaluate triggers."""
-        import os as _os_module
+        """Probe every 15min, absorb material, evaluate multi-gate triggers."""
         while self._running:
             try:
-                # Mechanical absorb — no LLM
                 self._absorb_tick()
-                # Check triggers
-                if len(self._material_buffer) >= 5 and self._reflect_enabled and self._check_cooldown("reflect"):
-                    self.reflect(force=True)
-                if self._express_enabled and self._check_cooldown("express"):
-                    self.speak(force=True)
+                self._evaluate_all_triggers()
             except Exception:
                 pass
-            time.sleep(self.cfg.cooldown_minutes * 60 if self.cfg.cooldown_minutes else 240)
+            time.sleep(900)  # probe every 15 minutes regardless of cooldowns
+
+    def _evaluate_all_triggers(self):
+        """Multi-gate trigger evaluation — content, activity, and idle-based."""
+        now = time.time()
+
+        # G1: Content-driven — material buffer overflow
+        if len(self._material_buffer) >= 5 and self._check_cooldown("reflect"):
+            self.reflect(force=True)
+            return
+
+        # G2: Activity-based — kanban tasks completed since last cycle
+        if self._activity_since_last_cycle() and self._check_cooldown("reflect"):
+            self.reflect(force=True)
+            return
+
+        # G3: Idle-based — Goran gone >6h, last EVOL >24h (guaranteed daily)
+        if self._idle_long_enough() and self._check_cooldown("express"):
+            # Run full cycle when organism has been dormant
+            self.full_cycle(force=True)
+            return
+
+        # Express trigger after reflect completes
+        if self._check_cooldown("express") and self._reflect_just_completed():
+            self.speak(force=True)
+
+    def _activity_since_last_cycle(self) -> bool:
+        """Check if kanban tasks completed since last EVOL cycle."""
+        marker = Path(self.cfg.profile_dir) / "evol" / ".last_cycle"
+        if not marker.exists():
+            return False
+        try:
+            last_ts = float(marker.read_text().strip())
+            kanban_db = Path(os.path.expanduser("~/.hermes/kanban/kanban.db"))
+            if not kanban_db.exists():
+                return False
+            import sqlite3
+            conn = sqlite3.connect(f"file:{kanban_db}?mode=ro", uri=True)
+            cursor = conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status='done' AND completed_at > ?",
+                (last_ts,))
+            count = cursor.fetchone()[0]
+            conn.close()
+            return count >= self.cfg.activity_trigger_tasks
+        except Exception:
+            return False
+
+    def _idle_long_enough(self) -> bool:
+        """Check if organism has been idle long enough for guaranteed daily cycle."""
+        marker = Path(self.cfg.profile_dir) / "evol" / ".last_cycle"
+        if not marker.exists():
+            return True  # never ran — do it
+        try:
+            last_ts = float(marker.read_text().strip())
+            hours_since = (time.time() - last_ts) / 3600
+            return hours_since >= 24
+        except Exception:
+            return True
+
+    def _reflect_just_completed(self) -> bool:
+        """Check if reflect phase just ran this tick."""
+        marker = Path(self.cfg.profile_dir) / "evol" / ".last_cycle"
+        if not marker.exists():
+            return False
+        try:
+            last_ts = float(marker.read_text().strip())
+            return (time.time() - last_ts) < 3600  # within past hour
+        except Exception:
+            return False
 
     def _absorb_tick(self):
         """Collect material from profile sources."""
