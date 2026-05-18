@@ -1,5 +1,5 @@
 name: hermes-evol
-version: 0.3.0
+version: 0.4.1
 description: EVOL — Subconscious observer. Zero gateway dependency, direct LLM API calls, three-tier memory architecture.
 author: falke-ai-circuit
 license: MIT
