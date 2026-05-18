@@ -175,6 +175,22 @@ def register(ctx):
         emoji="🔄",
     )
 
+    ctx.register_tool(
+        "evol_memorize", "evol",
+        _build_schema(
+            params={
+                "force": {
+                    "type": "boolean",
+                    "description": "Force memory consolidation (weights, circuit edits, knowledge wiki)",
+                }
+            },
+            required=[],
+        ),
+        _wrap(engine.memorize),
+        description="Trigger EVOL memory consolidation: adjust MEMORY.md weights, promote to Knowledge wiki, edit circuit files, demote stale items",
+        emoji="🧬",
+    )
+
     # ── Register slash command ──
     ctx.register_command(
         "evol",

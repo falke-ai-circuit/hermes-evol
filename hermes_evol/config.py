@@ -217,7 +217,7 @@ class EvolConfig:
     global_profiles: List[str] = field(default_factory=list)  # profiles to scan
 
     # ── Search backend ──
-    search_backend: Literal["duckduckgo", "wikipedia", "searxng", "firecrawl", "google"] = "duckduckgo"
+    search_backend: Literal["duckduckgo", "wikipedia", "searxng", "firecrawl", "google"] = "wikipedia"
     search_backend_url: str = ""    # SearXNG URL, Google CSE endpoint, etc.
     search_api_key: str = ""        # API key for firecrawl/google
 

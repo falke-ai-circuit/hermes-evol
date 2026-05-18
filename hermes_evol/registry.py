@@ -889,27 +889,35 @@ def _execute_searches(queries: List[str], cfg: EvolConfig) -> List[Dict]:
 
 
 def _search_duckduckgo(query: str) -> List[Dict]:
-    """Search DuckDuckGo Instant Answer API — free, no key required."""
-    url = f"https://api.duckduckgo.com/?q={urllib.parse.quote(query)}&format=json&no_html=1&skip_disambig=1"
-    data = _http_get_json(url, headers={"User-Agent": "EVOL/1.0"}, timeout=15)
-    if "_error" in data:
-        return [{"query": query, "source": "duckduckgo-error", "snippet": data["_error"]}]
+    """Search DuckDuckGo HTML endpoint — free, no key required, returns real web results."""
+    url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return [{"query": query, "source": "duckduckgo-error", "snippet": str(e)}]
 
+    # Parse result snippets from HTML
     entries = []
-    abstract = data.get("Abstract", "")
-    if abstract:
-        entries.append({"query": query, "source": data.get("AbstractURL", "duckduckgo.com"), "snippet": abstract[:500]})
-
-    for topic in data.get("RelatedTopics", [])[:3]:
-        if isinstance(topic, dict):
-            entries.append({"query": query, "source": topic.get("FirstURL", "duckduckgo.com"), "snippet": topic.get("Text", "")[:500]})
-
-    infobox = data.get("Infobox", {})
-    if infobox and infobox.get("content"):
-        entries.append({"query": query, "source": "duckduckgo.com", "snippet": json.dumps(infobox["content"])[:500]})
+    import re
+    # Extract result blocks: <a class="result__a" href="URL">TITLE</a> ... <a class="result__snippet">SNIPPET</a>
+    blocks = re.split(r'<a class="result__a"', html)[1:]  # skip before first result
+    for block in blocks[:5]:
+        url_match = re.search(r'href="([^"]+)"', block)
+        title_match = re.search(r'>([^<]+)</a>', block)
+        snippet_match = re.search(r'class="result__snippet">(.+?)</a>', block, re.DOTALL)
+        if url_match and snippet_match:
+            title = title_match.group(1).strip() if title_match else query
+            snippet = re.sub(r'<[^>]+>', '', snippet_match.group(1)).strip()
+            entries.append({
+                "query": query,
+                "source": url_match.group(1),
+                "snippet": f"{title}: {snippet[:500]}"
+            })
 
     if not entries:
-        entries.append({"query": query, "source": "duckduckgo", "snippet": f"No results for: {query}"})
+        entries.append({"query": query, "source": "duckduckgo", "snippet": f"No web results for: {query}"})
     return entries
 
 
