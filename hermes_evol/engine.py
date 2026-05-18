@@ -98,7 +98,7 @@ def run_cycle(
             if cfg.mode == "global":
                 absorbed = _absorb_global(cfg)
             else:
-                absorbed = _run_with_retry(absorb, cfg, "absorb")
+                absorbed = _run_with_retry(absorb, cfg, phase_name="absorb")
             result["phases"]["absorb"] = {"status": "ok", "sources_count": len(absorbed.get("circuit_files", {})), "data": absorbed}
         except Exception as e:
             result["phases"]["absorb"] = {"status": "error", "error": str(e)}
@@ -110,7 +110,7 @@ def run_cycle(
     # ── PHASE 2: REFLECT ──
     if "reflect" not in skip and cfg.is_phase_enabled("reflect"):
         try:
-            reflected = _run_with_retry(reflect, cfg, absorbed, "reflect")
+            reflected = _run_with_retry(reflect, cfg, absorbed, phase_name="reflect")
             result["phases"]["reflect"] = {
                 "status": "ok",
                 "patterns": len(reflected.get("patterns", [])),
@@ -128,7 +128,7 @@ def run_cycle(
     # ── PHASE 3: EXPLORE ──
     if "explore" not in skip and cfg.is_phase_enabled("explore"):
         try:
-            explored = _run_with_retry(explore, cfg, reflected, "explore")
+            explored = _run_with_retry(explore, cfg, reflected, phase_name="explore")
             result["phases"]["explore"] = {
                 "status": "ok",
                 "queries": explored.get("queries", []),
@@ -153,7 +153,7 @@ def run_cycle(
             expressed = None
         else:
             try:
-                expressed = _run_with_retry(express, cfg, reflected, explored, "express")
+                expressed = _run_with_retry(express, cfg, reflected, explored, phase_name="express")
                 result["phases"]["express"] = {
                     "status": "ok",
                     "mood": expressed.get("mood", "unknown"),
@@ -172,7 +172,7 @@ def run_cycle(
     # ── PHASE 5: MEMORIZE ──
     if "memorize" not in skip and cfg.is_phase_enabled("memorize"):
         try:
-            memorized = _run_with_retry(memorize, cfg, reflected, expressed, explored, "memorize")
+            memorized = _run_with_retry(memorize, cfg, reflected, expressed, explored, phase_name="memorize")
             result["phases"]["memorize"] = {
                 "status": "ok",
                 "items_scored": len(memorized.get("items", [])),
@@ -697,7 +697,7 @@ def _build_status(engine: EvolEngine) -> Dict[str, Any]:
 
     return {
         "engine": "hermes-evol",
-        "version": "0.3.0",
+        "version": "0.4.1",
         "profile": engine.profile,
         "mode": engine.mode,
         "heartbeat_alive": engine._running,
