@@ -100,6 +100,7 @@ def run_cycle(
             else:
                 absorbed = _run_with_retry(absorb, cfg, phase_name="absorb")
             result["phases"]["absorb"] = {"status": "ok", "sources_count": len(absorbed.get("circuit_files", {})), "data": absorbed}
+            _run_phase_post_hook(cfg, "absorb", absorbed, result)
         except Exception as e:
             result["phases"]["absorb"] = {"status": "error", "error": str(e)}
             return {**result, "status": "error", "error": f"absorb failed: {e}"}
@@ -118,6 +119,7 @@ def run_cycle(
                 "bridge_signals": len(reflected.get("bridge_signals", [])),
                 "data": reflected,
             }
+            _run_phase_post_hook(cfg, "reflect", reflected, result)
         except Exception as e:
             result["phases"]["reflect"] = {"status": "error", "error": str(e)}
             reflected = {"patterns": [], "anomalies": [], "bridge_signals": [], "circuit_health": {}}
@@ -135,6 +137,7 @@ def run_cycle(
                 "discoveries": len(explored.get("discoveries", [])),
                 "data": explored,
             }
+            _run_phase_post_hook(cfg, "explore", explored, result)
         except Exception as e:
             result["phases"]["explore"] = {"status": "error", "error": str(e)}
             explored = {"queries": [], "results": [], "discoveries": []}
@@ -148,7 +151,7 @@ def run_cycle(
 
     # ── PHASE 4: EXPRESS ──
     if "express" not in skip and cfg.is_phase_enabled("express"):
-        if not _express_can_run(cfg):
+        if not force and not _express_can_run(cfg):
             result["phases"]["express"] = {"status": "skipped", "reason": "cooldown"}
             expressed = None
         else:
@@ -160,8 +163,9 @@ def run_cycle(
                     "insights": len(expressed.get("insights", [])),
                     "data": expressed,
                 }
-                # Update last express timestamp
                 _touch_last_express(cfg)
+                # Generic post-phase hook
+                _run_phase_post_hook(cfg, "express", expressed, result)
             except Exception as e:
                 result["phases"]["express"] = {"status": "error", "error": str(e)}
                 expressed = None
@@ -180,6 +184,7 @@ def run_cycle(
                 "proposed": len(memorized.get("proposals", [])),
                 "data": memorized,
             }
+            _run_phase_post_hook(cfg, "memorize", memorized, result)
         except Exception as e:
             result["phases"]["memorize"] = {"status": "error", "error": str(e)}
     else:
@@ -187,7 +192,6 @@ def run_cycle(
 
     # ── Finalize ──
     _touch_last_cycle(cfg)
-    _append_evol_jsonl(cfg, result)
     result["duration_seconds"] = round(time.time() - t_start, 2)
 
     return result
@@ -309,7 +313,6 @@ def run_session_cycle(
         result["phases"]["memorize"] = {"status": "skipped"}
 
     result["duration_seconds"] = round(time.time() - t_start, 2)
-    _append_evol_jsonl(cfg, result)
     return result
 
 
@@ -325,8 +328,8 @@ def _absorb_session(cfg: EvolConfig, session_id: Optional[str] = None) -> Dict[s
         "session_id": session_id,
     }
 
-    # Role circuit files only (MEMORY.md for this role)
-    for fname in ["MEMORY.md"]:
+    # Role circuit files — the profile's own SOUL.md, AGENTS.md, MEMORY.md
+    for fname in ["SOUL.md", "AGENTS.md", "MEMORY.md"]:
         path = cfg.get_circuit_path(fname)
         content = _safe_read(path)
         if content:
@@ -470,24 +473,117 @@ def _touch_marker(cfg: EvolConfig, name: str):
         pass
 
 
-def _append_evol_jsonl(cfg: EvolConfig, cycle_result: Dict[str, Any]):
-    """Append a cycle result to the profile's evol.jsonl."""
-    log_path = Path(cfg.profile_dir) / "evol.jsonl"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    entry = {
-        "ts": time.time(),
-        "type": cycle_result.get("mode", "cycle"),
-        "profile": cfg.profile,
-        "operation_mode": cfg.operation_mode,
-        "duration_seconds": cycle_result.get("duration_seconds", 0),
-        "phases": cycle_result.get("phases", {}),
-        "status": cycle_result.get("status", "error"),
-    }
+# ── Generic Phase Post-Hook ───────────────────────────────────────
+
+PHASE_RESULT_KEYS = {
+    # phase → list of top-level keys in the phase result dict
+    "absorb": ["circuit_files", "session_summary", "timestamp"],
+    "reflect": ["patterns", "signal_summary", "anomalies", "recommended_action"],
+    "express": ["monologue", "mood", "insights", "portrait_prompt", "circuit_poem", "unanswered"],
+    "explore": ["queries", "results", "discoveries"],
+    "memorize": ["items", "applied", "proposals"],
+}
+
+
+def _run_phase_post_hook(cfg: EvolConfig, phase: str, phase_data: Dict[str, Any], cycle_result: Dict[str, Any]):
+    """Execute a post-phase hook if configured for this phase.
+
+    Hooks are configured in evol.json:
+      "phase_post_commands": {"express": "python3 skills/evol/scripts/hooks/express-post.py --monologue \"$PHASE_monologue\" --json"}
+
+    Environment variables available to the hook:
+      PHASE_RESULT_FILE  — path to temp JSON file with full phase data
+      PHASE_{KEY}        — for each top-level key in the phase result (e.g. PHASE_monologue, PHASE_mood)
+      EVOL_PROFILE       — the current profile name
+      EVOL_PHASE         — the phase name
+    """
+    cmd = cfg.phase_post_commands.get(phase, "")
+    if not cmd:
+        return
+
+    import subprocess, tempfile
+
+    log.info("phase_post_hook[%s]: running %s", phase, cmd[:80])
+
+    # Write full phase data to a temp file (canonical source)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, prefix=f"evol-{phase}-") as f:
+        json.dump(phase_data, f)
+        result_file = f.name
+
+    env = os.environ.copy()
+    env["PHASE_RESULT_FILE"] = result_file
+    env["EVOL_PROFILE"] = cfg.profile
+    env["EVOL_PHASE"] = phase
+
+    # Expose top-level keys as PHASE_{KEY} env vars
+    known_keys = PHASE_RESULT_KEYS.get(phase, list(phase_data.keys()))
+    for key in known_keys:
+        val = phase_data.get(key)
+        if val is not None:
+            if isinstance(val, (list, dict)):
+                env[f"PHASE_{key}"] = json.dumps(val)
+            else:
+                env[f"PHASE_{key}"] = str(val)[:4000]
+
     try:
-        with open(log_path, "a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except OSError:
+        result = subprocess.run(
+            ["bash", "-c", cmd],
+            capture_output=True, text=True,
+            timeout=180,
+            env=env,
+            cwd="/opt/data",
+        )
+        stdout = result.stdout.strip()
+        stderr_tail = result.stderr.strip()[-300:] if result.stderr else ""
+        log.info("phase_post_hook[%s]: rc=%s stdout=%s stderr=%s",
+                 phase, result.returncode, stdout[:200], stderr_tail[:200])
+
+        # Parse hook output into cycle result
+        if stdout:
+            hook_result = _parse_hook_output(stdout)
+            if hook_result:
+                phase_key = f"phases.{phase}.media"
+                # Store under phases.{phase}.media in cycle result
+                phase_result = cycle_result.setdefault("phases", {}).setdefault(phase, {})
+                phase_result["media"] = hook_result
+
+    except subprocess.TimeoutExpired:
+        log.error("phase_post_hook[%s]: timeout (>180s)", phase)
+    except Exception as e:
+        log.error("phase_post_hook[%s]: %s", phase, e)
+    finally:
+        try:
+            os.unlink(result_file)
+        except OSError:
+            pass
+
+
+def _parse_hook_output(stdout: str) -> Dict[str, str]:
+    """Parse hook stdout — JSON dict or file paths."""
+    # Try JSON first
+    try:
+        data = json.loads(stdout)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if v and isinstance(v, str) and os.path.exists(v)}
+    except (json.JSONDecodeError, ValueError):
         pass
+
+    # Fall back to file path parsing
+    media = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if line.endswith((".mp4", ".mp3", ".jpg", ".png", ".webp")):
+            if line.startswith("MEDIA:"):
+                line = line[6:]
+            if os.path.exists(line):
+                ext = os.path.splitext(line)[1]
+                if ext == ".mp4":
+                    media["video"] = line
+                elif ext == ".mp3":
+                    media["voice"] = line
+                elif ext in (".jpg", ".png", ".webp"):
+                    media["portrait"] = line
+    return media
 
 
 def disable(cfg=None):
@@ -785,16 +881,23 @@ class EvolEngine:
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
-    def task_end(self, session_id: str = "") -> Dict[str, Any]:
+    def task_end(self, session_id: str = "", profile: str = "") -> Dict[str, Any]:
         """Session-mode EVOL — single-shot cycle for subagent task completion.
         
         Called by coder/reviewer/analyst/etc. after completing a task.
         Runs absorb→reflect→express→explore→memorize immediately.
         No heartbeat. No cascade. No idle depth.
         Writes to role MEMORY.md, skills, evol.jsonl. Never conductor circuit.
+        
+        Args:
+            session_id: Optional session ID to attach to cycle record
+            profile: Override profile name. Subagents MUST pass their own profile
+                     (e.g., "coder", "analyst", "reviewer") to write to their
+                     own MEMORY.md and evol.jsonl. Defaults to configured profile.
         """
         try:
-            result = run_session_cycle(profile=self.profile, session_id=session_id or None)
+            target_profile = profile or self.profile
+            result = run_session_cycle(profile=target_profile, session_id=session_id or None)
             return {"status": "ok", "data": result}
         except Exception as e:
             return {"status": "error", "error": str(e)}

@@ -139,8 +139,10 @@ def _call_llm(
     Zero gateway dependency — direct API calls only.
     Returns raw text response.
     """
-    provider = phase_config.provider or "venice"
-    model = phase_config.model or "deepseek-v4-pro"
+    # Resolve provider/model from profile's Hermes config.yaml
+    # Every profile has provider/model configured. Default to ollama-cloud.
+    provider = phase_config.provider or cfg._hermes_provider or "ollama-cloud"
+    model = phase_config.model or cfg._hermes_model or "deepseek-v4-pro"
     api_key = phase_config.api_key
 
     # Resolve API key from environment (provider-aware)
@@ -150,11 +152,8 @@ def _call_llm(
         if key_env:
             api_key = os.environ.get(key_env, "")
     if not api_key:
-        # Broad fallback
-        for env_var in ["OLLAMA_API_KEY", "VENICE_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"]:
-            api_key = os.environ.get(env_var, "")
-            if api_key:
-                break
+        # No cross-provider key fallback — prevents key leaks (Venice key → Ollama Cloud = 401)
+        return f"[evol error: no API key for provider '{provider}' — set {key_env} in environment or api_key in phase config]"
 
     temperature = phase_config.temperature
     actual_max_tokens = phase_config.max_tokens or max_tokens
@@ -721,7 +720,7 @@ def _parse_reflect_response(raw: str, cfg: EvolConfig, absorbed: Dict[str, Any])
 # EXPLORE — Discover new knowledge via external queries
 # ═══════════════════════════════════════════════════════════════════
 
-def explore(cfg: EvolConfig, reflected: Dict[str, Any]) -> Dict[str, Any]:
+def explore(cfg: EvolConfig, reflected: Dict[str, Any], query_limit: int = 3) -> Dict[str, Any]:
     """
     Formulate search queries from reflect patterns and explore externally.
     Uses SearXNG (if available) or web search.
@@ -1051,7 +1050,7 @@ def _analyze_discoveries(cfg: EvolConfig, results: List[Dict], model_cfg: PhaseM
 # EXPRESS — Creative synthesis, monologue, outward signal
 # ═══════════════════════════════════════════════════════════════════
 
-def express(cfg: EvolConfig, reflected: Dict[str, Any], explored: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def express(cfg: EvolConfig, reflected: Dict[str, Any], explored: Optional[Dict[str, Any]] = None, style: str = "creative") -> Dict[str, Any]:
     """
     Synthesize reflections and explorations into creative output.
     
@@ -1210,6 +1209,7 @@ def memorize(
     reflected: Dict[str, Any],
     expressed: Optional[Dict[str, Any]] = None,
     explored: Optional[Dict[str, Any]] = None,
+    scope: str = "full",
 ) -> Dict[str, Any]:
     """
     Score all findings from the cycle and promote those exceeding
@@ -1340,27 +1340,56 @@ def _build_memorize_prompt(
         for i, d in enumerate(discoveries):
             parts.append(f"{i+1}. {d.get('topic', '?')}: {d.get('finding', '')[:150]}")
 
-    parts.append("\n## Instructions")
+    parts.append("\n## Valid Target Files (choose one per item)")
+    parts.append("- SOUL.md     — identity-level changes: role soul, fundamental behaviors, character shifts (≥0.85)")
+    parts.append("- AGENTS.md   — new gates, procedural rules, anti-patterns (≥0.75)")
+    parts.append("- MEMORY.md   — working knowledge, gotchas, techniques, domain facts (≥0.50)")
+    parts.append("- KNOWLEDGE   — low-weight trivia, one-off facts (<0.50)")
+    parts.append("")
+    parts.append("## Demotion Rules (STRICT — never skip steps)")
+    parts.append("- CIRCUIT → MEMORY.md first (never directly to KNOWLEDGE)")
+    parts.append("- MEMORY.md → KNOWLEDGE only after being in MEMORY.md")
+    parts.append("- KNOWLEDGE → phase out (delete) when weight < 0.15")
+    parts.append("")
+    parts.append("## Instructions")
     parts.append("For each finding, score it and determine where it belongs. Return JSON:")
     parts.append("""
 {
   "items": [
     {
       "description": "what was learned",
-      "raw_weight": 0.85,           // 0-1, how important is this finding
-      "target": "MEMORY.md",         // which circuit file to update
-      "action": "append",            // append | replace | promote
-      "suggested_text": "exact text to add/insert",
-      "rationale": "why this target and action"
+      "raw_weight": 0.85,
+      "target": "SOUL.md",
+      "action": "append",
+      "suggested_text": "| 2026-05-19 | PATTERN-NAME (wt:0.85) — explanation | EVOL session MEMORIZE |",
+      "rationale": "why this target and weight"
+    },
+    {
+      "description": "practical technique discovered",
+      "raw_weight": 0.65,
+      "target": "MEMORY.md",
+      "action": "append",
+      "suggested_text": "§ Technique-Name (wt:0.65)\\nDescription of what works and why.\\n",
+      "rationale": "useful but not identity-defining"
+    },
+    {
+      "description": "new gate needed to prevent recurrence",
+      "raw_weight": 0.78,
+      "target": "AGENTS.md",
+      "action": "append",
+      "suggested_text": "| G-SOMETHING | When X happens | Do Y |",
+      "rationale": "recurring problem needs procedural guard"
     }
   ]
 }
 """)
     parts.append("Scoring rules:")
-    parts.append("- Bridge paradoxes with known fixes → promote to SOUL.md at wt≥0.85")
-    parts.append("- Recurring patterns (3+ cycles) → promote to AGENTS.md")
-    parts.append("- New discoveries → MEMORY.md at wt≥0.50")
-    parts.append("- Only promote items exceeding the target file's circuit weight")
+    parts.append("- Identity-defining insights about the role's SOUL → SOUL.md at wt≥0.85")
+    parts.append("- Recurring mistakes or new procedural rules → AGENTS.md at wt≥0.75")
+    parts.append("- Practical techniques, gotchas, domain knowledge → MEMORY.md at wt≥0.50")
+    parts.append("- Low-weight trivia → KNOWLEDGE (will decay)")
+    parts.append("- DISTRIBUTE findings across all 3 circuit files, not just MEMORY.md")
+    parts.append("- DEMOTIONS: Always one tier at a time. Circuit→Memory→Knowledge. Never skip.")
     parts.append("- Output ONLY the JSON object, no markdown wrapper")
 
     return "\n".join(parts)

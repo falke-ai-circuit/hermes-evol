@@ -29,20 +29,30 @@ class PhaseModelConfig:
     max_tokens: int = 4096
 
     def to_dict(self) -> dict:
+        # Mask API key: show only first+last 4 chars if non-empty
+        key = self.api_key
+        if key and len(key) > 8:
+            key = key[:4] + "..." + key[-4:]
+        elif key:
+            key = "***"
         return {
             "provider": self.provider,
             "model": self.model,
-            "api_key": self.api_key,
+            "api_key": key,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "PhaseModelConfig":
+        api_key = d.get("api_key", "")
+        # Skip if it looks like a masked key from a previous save
+        if api_key and ("..." in api_key or api_key == "***"):
+            api_key = ""
         return cls(
             provider=d.get("provider", ""),
             model=d.get("model", ""),
-            api_key=d.get("api_key", ""),
+            api_key=api_key,
             temperature=d.get("temperature", 0.7),
             max_tokens=d.get("max_tokens", 4096),
         )
@@ -94,6 +104,11 @@ UNIVERSAL_CIRCUIT_FILES = ["SOUL.md", "AGENTS.md", "MEMORY.md", "IDENTITY.md"]
 # EVOL calls these APIs directly — no Hermes gateway needed.
 # Extendable: add any OpenAI-compatible provider.
 PROVIDER_ENDPOINTS: Dict[str, dict] = {
+    "hermes": {
+        "base_url": "http://host.docker.internal:8642/v1",
+        "api_key_env": "HERMES_API_KEY",
+        "description": "Hermes Gateway (local Docker) — API server",
+    },
     "ollama-cloud": {
         "base_url": "https://ollama.com/v1",
         "api_key_env": "OLLAMA_API_KEY",
@@ -226,6 +241,14 @@ class EvolConfig:
     max_retries_per_phase: int = 3
     max_cycles_per_day: int = 6
 
+    # ── Post-phase hooks (per-phase, customizable per-profile) ──
+    # Dict mapping phase name → shell command. Executed after phase completes successfully.
+    # Environment: PHASE_RESULT_FILE (path to JSON), PHASE_{KEY}={value} for top-level result keys.
+    # Example: {"express": "python3 skills/express/scripts/express_organ_v2.py --text \"$PHASE_monologue\" --json"}
+    phase_post_commands: Dict[str, str] = field(default_factory=dict)
+
+    # Backward compat — reads from evol.json "express_post_command", maps into phase_post_commands["express"]
+
     def __init__(self, profile: Optional[str] = None, mode: Optional[str] = None):
         """Initialize EVOL config for a profile."""
         # ── Set dataclass defaults (custom __init__ must do this explicitly) ──
@@ -341,6 +364,10 @@ class EvolConfig:
         provider = model_section.get("provider", "ollama-cloud")
         model = model_section.get("default", "deepseek-v4-pro")
 
+        # Surface for _call_llm fallback
+        self._hermes_provider = provider
+        self._hermes_model = model
+
         # Resolve endpoint
         endpoint = PROVIDER_ENDPOINTS.get(provider)
         if not endpoint:
@@ -402,6 +429,13 @@ class EvolConfig:
             self.max_retries_per_phase = data["max_retries_per_phase"]
         if "max_cycles_per_day" in data:
             self.max_cycles_per_day = data["max_cycles_per_day"]
+        # Phase post hooks (standardized) + backward compat
+        if "phase_post_commands" in data and isinstance(data["phase_post_commands"], dict):
+            self.phase_post_commands = data["phase_post_commands"]
+        if "express_post_command" in data and data["express_post_command"]:
+            # Backward compat: old single-field → new dict
+            if "express" not in self.phase_post_commands:
+                self.phase_post_commands["express"] = data["express_post_command"]
 
         # Phase toggles
         if "phases" in data:
@@ -425,7 +459,10 @@ class EvolConfig:
         if "search_backend_url" in data:
             self.search_backend_url = data["search_backend_url"]
         if "search_api_key" in data:
-            self.search_api_key = data["search_api_key"]
+            sak = data["search_api_key"]
+            # Skip masked keys from previous saves
+            if not ("..." in sak or sak == "***"):
+                self.search_api_key = sak
 
         # Circuit weights (custom overrides)
         if "circuit_weights" in data:
@@ -577,17 +614,35 @@ class EvolConfig:
         return self.enabled and self.phase_enabled.get(phase, True)
 
     def to_dict(self) -> dict:
-        """Serialize to dict for evol.json."""
+        """Serialize to dict for evol.json. API keys are masked for security."""
+        # Mask search_api_key
+        sak = self.search_api_key
+        if sak and len(sak) > 8:
+            sak = sak[:4] + "..." + sak[-4:]
+        elif sak:
+            sak = "***"
+
         return {
             "mode": self.mode,
             "enabled": self.enabled,
             "edit_mode": self.edit_mode,
+            "operation_mode": self.operation_mode,
             "cooldown_minutes": self.cooldown_minutes,
             "express_cooldown_hours": self.express_cooldown_hours,
             "idle_trigger_minutes": self.idle_trigger_minutes,
             "activity_trigger_tasks": self.activity_trigger_tasks,
+            "phase_triggers": self.phase_triggers,
+            "fallback_cycle_hours": self.fallback_cycle_hours,
+            "express_style": self.express_style,
+            "explore_query_limit": self.explore_query_limit,
+            "session_scope": self.session_scope,
             "max_retries_per_phase": self.max_retries_per_phase,
             "max_cycles_per_day": self.max_cycles_per_day,
+            "express_post_command": self.phase_post_commands.get("express", ""),  # backward compat
+            "phase_post_commands": self.phase_post_commands,
+            "search_backend": self.search_backend,
+            "search_backend_url": self.search_backend_url,
+            "search_api_key": sak,
             "phases": self.phase_enabled,
             "phase_models": {
                 phase: pm.to_dict() for phase, pm in self.phase_models.items()

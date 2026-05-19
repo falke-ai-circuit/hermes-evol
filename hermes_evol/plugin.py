@@ -48,8 +48,10 @@ def _wrap(fn):
     """
     def _wrapped(*args, **kwargs):
         # Hermes dispatch: handler({"force": True}) — positional dict
-        if args and isinstance(args[0], dict) and not kwargs:
-            kwargs = args[0]
+        # Merge positional dict into kwargs (don't guard with "not kwargs" — 
+        # Hermes injects internal kwargs like task_id, which blocks the merge)
+        if args and isinstance(args[0], dict):
+            kwargs.update(args[0])
         # Hermes injects internal kwargs (task_id, user_task, session_id, etc).
         # Introspect the target function's signature and only pass accepted params.
         import inspect
@@ -198,12 +200,16 @@ def register(ctx):
                 "session_id": {
                     "type": "string",
                     "description": "Optional session ID to attach to the cycle record",
-                }
+                },
+                "profile": {
+                    "type": "string",
+                    "description": "Your profile name (e.g., 'coder', 'analyst', 'reviewer'). REQUIRED for subagents — passes your profile so EVOL writes to YOUR MEMORY.md and evol.jsonl, not conductor's.",
+                },
             },
             required=[],
         ),
         _wrap(engine.task_end),
-        description="Run session-mode EVOL cycle on task completion. For subagent profiles (coder, reviewer, analyst, etc). Absorb→reflect→express→explore→memorize. Writes to role MEMORY.md, skills, and evol.jsonl. Never touches conductor circuit.",
+        description="Run session-mode EVOL cycle on task completion. For subagent profiles (coder, reviewer, analyst, etc). Pass profile='your_profile_name' so EVOL writes to YOUR files. Absorb→reflect→express→explore→memorize. Never touches conductor circuit.",
         emoji="🔚",
     )
 
