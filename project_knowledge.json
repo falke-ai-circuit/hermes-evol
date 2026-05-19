@@ -1,86 +1,128 @@
 {
   "project": "hermes-evol",
-  "version": "0.4.1",
-  "updated": "2026-05-18",
-
-  "hot_cache": {
-    "providers": {
-      "ollama-cloud": {"base_url": "https://ollama.com/v1", "key_env": "OLLAMA_API_KEY", "default_model": "deepseek-v4-pro"},
-      "venice": {"base_url": "https://api.venice.ai/api/v1", "key_env": "VENICE_API_KEY", "default_model": "deepseek-v4-pro"},
-      "duckduckgo": {"url": "https://api.duckduckgo.com", "free": true},
-      "arxiv": {"url": "http://export.arxiv.org/api/query", "free": true}
-    },
-    "phase_model_map": {
-      "reflect": "ollama-cloud/deepseek-v4-pro",
-      "explore": "ollama-cloud/deepseek-v4-pro + DuckDuckGo/arXiv",
-      "express": "venice/deepseek-v4-pro",
-      "memorize": "ollama-cloud/deepseek-v4-pro"
-    },
-    "max_tokens": {"deepseek-v4-pro": 8192, "venice": 4096},
-    "retries": 9,
-    "heartbeat_interval": 900,
-    "three_tier_thresholds": {
-      "promote_knowledge_to_memory": 0.65,
-      "promote_memory_to_circuit": 0.85,
-      "demote_circuit_to_memory": 0.50,
-      "demote_memory_to_knowledge": 0.40,
-      "phase_out": 0.15
-    }
-  },
-
-  "gotchas": [
+  "last_updated": "2026-05-19T01:24:26.876865+00:00",
+  "hot_cache": [
     {
-      "name": "pycache-silences-edits",
-      "severity": "critical",
-      "pattern": "Source changes have no effect after gateway restart",
-      "fix": "rm -rf hermes_evol/__pycache__/ before restart",
-      "detection": "Compare .py mtime vs .pyc mtime"
+      "topic": "__pycache__ silences source edits after restart",
+      "weight": 0.95,
+      "last_hit": "2026-05-18T16:00:00Z",
+      "files": [
+        "hermes_evol/engine.py",
+        "hermes_evol/registry.py"
+      ],
+      "note": "Always rm -rf __pycache__ before gateway restart. Gateway loads stale bytecode."
     },
     {
-      "name": "venice-glm-heretic-thinking",
-      "severity": "high",
-      "pattern": "GLM heretic returns empty content, all output in reasoning_content",
-      "fix": "Use deepseek-v4-pro for EXPRESS, not GLM variant",
-      "detection": "Check content field empty + reasoning_content populated"
+      "topic": "Gateway tool dispatch injects internal kwargs (task_id, user_task, session_id)",
+      "weight": 0.9,
+      "last_hit": "2026-05-18T16:00:00Z",
+      "files": [
+        "hermes_evol/plugin.py"
+      ],
+      "note": "Use signature introspection in _wrap(), not hardcoded blacklist."
     },
     {
-      "name": "plugin-loads-from-profile-dir",
-      "severity": "medium",
-      "pattern": "Plugin not found after copying to global plugins/",
-      "fix": "Plugin lives in profiles/<name>/plugins/hermes-evol/, not global",
-      "detection": "gateway.log shows no 'hermes-evol registering'"
+      "topic": "edit_mode + search_backend defaults overridden by _derive_defaults()",
+      "weight": 0.85,
+      "last_hit": "2026-05-18T16:00:00Z",
+      "files": [
+        "hermes_evol/config.py"
+      ],
+      "note": "Fixed: edit_mode='suggested', search_backend='wikipedia' in _derive_defaults. Config file (evol.json) overrides both."
     },
     {
-      "name": "gateway-contention-kills-memorize",
-      "severity": "high",
-      "pattern": "MEMORIZE returns 0 items after successful REFLECT",
-      "fix": "Built-in 30s cooldown retry in memorize(), 3rd fallback to Venice",
-      "detection": "memorize_failed.txt written in evol/ directory"
+      "topic": "_safe_write returned void — auto-apply broken since v0.1.0",
+      "weight": 0.88,
+      "last_hit": "2026-05-18T16:00:00Z",
+      "files": [
+        "hermes_evol/registry.py"
+      ],
+      "note": "Fixed: returns True/False instead of implicit None."
     },
     {
-      "name": "old-evol-entries-string-format",
-      "severity": "low",
-      "pattern": "evol.jsonl entries pre-v0.4.0 use string for 'express' field",
-      "fix": "_load_previous_cycle() handles both dict and string formats",
-      "detection": "TypeError reading express field"
+      "topic": "hermes-evol.bak directory poisoned plugin loading",
+      "weight": 0.82,
+      "last_hit": "2026-05-18T16:00:00Z",
+      "files": [
+        "hermes_evol/__init__.py"
+      ],
+      "note": "Backup directory with its own plugin.yaml and register() hijacked every restart. Deleted."
     }
   ],
-
-  "domain_index": {
-    "registry.py": ["evol", "plugin-dev"],
-    "engine.py": ["evol", "plugin-dev"],
-    "config.py": ["evol", "openclaw-model-config"],
-    "knowledge.py": ["memory", "evol"],
-    "plugin.py": ["hermes-agent", "evol"],
-    "commands.py": ["hermes-agent"]
-  },
-
-  "file_sizes": {
-    "registry.py": "~1600 lines",
-    "engine.py": "~700 lines",
-    "config.py": "~585 lines",
-    "knowledge.py": "~535 lines",
-    "plugin.py": "~182 lines",
-    "commands.py": "~89 lines"
+  "gotchas": [
+    {
+      "id": "pycache-silences-edits",
+      "problem": "Gateway loads stale bytecode after source edits",
+      "root_cause": "Python __pycache__/ .pyc files persist across restarts",
+      "fix": "rm -rf hermes_evol/__pycache__/ __pycache__/ before docker restart",
+      "severity": "HIGH",
+      "last_hit": "2026-05-18T16:00:00Z",
+      "hits": 4
+    },
+    {
+      "id": "gateway-tool-task-id-injection",
+      "problem": "Hermes gateway injects task_id, user_task, session_id, actor_id into tool calls",
+      "root_cause": "Internal gateway dispatch adds kwargs before forwarding to registered tools",
+      "fix": "Use signature introspection in _wrap() to filter kwargs not in function signature",
+      "severity": "HIGH",
+      "last_hit": "2026-05-18T16:00:00Z",
+      "hits": 3
+    },
+    {
+      "id": "backup-plugin-poisoning",
+      "problem": "hermes-evol.bak directory with own plugin.yaml overwrites live plugin registration",
+      "root_cause": "Gateway plugin scanner loads all directories in plugins/, backup had its own register() with v0.1.0 code",
+      "fix": "Delete .bak directories immediately. Never create backups inside plugins/",
+      "severity": "HIGH",
+      "last_hit": "2026-05-18T16:00:00Z",
+      "hits": 1
+    },
+    {
+      "id": "safe-write-void-return",
+      "problem": "_safe_write returned None (implicit) or None on pass — every auto-apply reported failed",
+      "root_cause": "Function was void, _apply_circuit_edit did `return _safe_write(...)` → always falsy",
+      "fix": "Return True on success, False on failure",
+      "severity": "HIGH",
+      "last_hit": "2026-05-18T16:00:00Z",
+      "hits": 1
+    }
+  ],
+  "recent_changes": [
+    {
+      "version": "v0.4.1",
+      "date": "2026-05-18",
+      "summary": "Multi-gate heartbeat + idle-depth scaling + evol.jsonl as single source of truth + auto-apply fix + multi-backend search",
+      "files": [
+        "hermes_evol/engine.py",
+        "hermes_evol/registry.py",
+        "hermes_evol/config.py",
+        "hermes_evol/plugin.py",
+        "hermes_evol/__init__.py"
+      ]
+    }
+  ],
+  "architecture": {
+    "files": {
+      "hermes_evol/registry.py": "All 5 phase implementations + LLM calling + promotion engine",
+      "hermes_evol/engine.py": "EvolEngine bridge class + heartbeat thread + trigger gates",
+      "hermes_evol/config.py": "EvolConfig dataclass + PROVIDER_ENDPOINTS + profile detection",
+      "hermes_evol/plugin.py": "Gateway entry point — register() + _wrap() for JSON-safe tools",
+      "hermes_evol/knowledge.py": "Three-tier knowledge layer: wikilinks, decay, capacity management",
+      "hermes_evol/commands.py": "/evol slash command handler",
+      "hermes_evol/stores.py": "JSONL state/material/voice store classes"
+    },
+    "phases": [
+      "ABSORB",
+      "REFLECT",
+      "EXPLORE",
+      "EXPRESS",
+      "MEMORIZE"
+    ],
+    "providers": {
+      "REFLECT": "ollama-cloud/deepseek-v4-pro",
+      "EXPLORE": "ollama-cloud/deepseek-v4-pro + Wikipedia/arXiv",
+      "EXPRESS": "venice/deepseek-v4-pro",
+      "MEMORIZE": "ollama-cloud/deepseek-v4-pro"
+    }
   }
 }

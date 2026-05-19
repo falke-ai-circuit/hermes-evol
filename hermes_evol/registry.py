@@ -1443,7 +1443,11 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
 
             # Apply to circuit
             if cfg.edit_mode == "auto":
-                success = _apply_circuit_edit(cfg, promotion["file"], suggested, item.get("action", "append"))
+                success = _apply_circuit_edit(
+                    cfg, promotion["file"], suggested,
+                    item.get("action", "append"),
+                    concept=concept, weight=raw_weight
+                )
                 if success:
                     applied.append({**promotion, "applied": True, "tier": "circuit"})
                 else:
@@ -1526,22 +1530,49 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
     return applied, proposals
 
 
-def _apply_circuit_edit(cfg: EvolConfig, filename: str, text: str, action: str) -> bool:
+def _format_circuit_entry(filename: str, concept: str, text: str, weight: float) -> str:
     """
-    Apply an edit to a circuit file.
+    Format a circuit file append in standard CIRCUIT format (circuit-file-editing skill).
+    SOUL.md / IDENTITY.md / AGENTS.md → Evolution Log table row
+    MEMORY.md → § marker + table row in Core Patterns
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    slug = concept.strip().replace("\n", " ")[:80]
+
+    if filename in ("SOUL.md", "IDENTITY.md", "AGENTS.md"):
+        # Standard Evolution Log table row
+        return f"| {today} | {slug} (wt:{weight:.2f}) | {text.strip()[:200]} |"
+
+    elif filename == "MEMORY.md":
+        return f"\n§ {slug} (wt:{weight:.2f})\n{text.strip()}\n"
+
+    else:
+        # Generic: § marker
+        return f"\n§ {slug} (wt:{weight:.2f})\n{text.strip()}\n"
+
+
+def _apply_circuit_edit(cfg: EvolConfig, filename: str, text: str, action: str,
+                        concept: str = "", weight: float = 0.5) -> bool:
+    """
+    Apply an edit to a circuit file respecting CIRCUIT format standards.
+    - SOUL/AGENTS/IDENTITY: appends to ## Evolution Log table
+    - MEMORY.md: appends § marker entries
+    - Preserves YAML frontmatter on new file creation
     Returns True on success.
     """
     path = cfg.get_circuit_path(filename)
+    formatted = _format_circuit_entry(filename, concept or "EVOL finding", text, weight)
+
     if not Path(path).exists():
-        # Create new file
-        return _safe_write(path, f"# {filename} — Auto-created by EVOL\n\n{text}\n")
+        # Create with proper YAML frontmatter
+        frontmatter = f"---\nrole: {filename.replace('.md', '')}\nlast_reflect: {_utc_now()[:10]}\nreflect_count: 0\n---\n\n"
+        return _safe_write(path, frontmatter + f"# {filename} — Auto-created by EVOL\n\n## Evolution Log\n\n{formatted}\n")
 
     current = _safe_read(path)
     if not current:
-        return _safe_write(path, text)
+        return _safe_write(path, formatted)
 
     if action == "replace":
-        # This is a full replacement — risky, only for small files
         if "old_text" in text and "new_text" in text:
             try:
                 spec = json.loads(text) if text.startswith("{") else {"old": "", "new": text}
@@ -1554,8 +1585,34 @@ def _apply_circuit_edit(cfg: EvolConfig, filename: str, text: str, action: str) 
                 pass
         return False
 
-    # Append mode (default)
-    new_content = current.rstrip() + "\n\n" + text + "\n"
+    # Append to the correct section
+    if filename in ("SOUL.md", "IDENTITY.md", "AGENTS.md"):
+        # Find ## Evolution Log section, append table row
+        evo_section = "## Evolution Log"
+        if evo_section in current:
+            # Insert before next ## section or at end
+            sections = current.split("\n## ")
+            for i, s in enumerate(sections):
+                if s.startswith("Evolution Log"):
+                    # Append to this section (before next section if exists)
+                    parts = s.split("\n\n", 1)
+                    if len(parts) > 1 and "|" in parts[1].split("\n")[0]:
+                        # Already has a table — append row
+                        sections[i] = parts[0] + "\n\n" + parts[1].rstrip() + "\n" + formatted
+                    else:
+                        # No table yet — add table header + row
+                        table_header = "| Date | Promotion | Source |\n|------|-----------|--------|"
+                        sections[i] = parts[0] + "\n\n" + table_header + "\n" + formatted
+                    break
+            new_content = "\n## ".join(sections)
+        else:
+            # No Evolution Log section — append one at end
+            table_header = "\n## Evolution Log\n\n| Date | Promotion | Source |\n|------|-----------|--------|"
+            new_content = current.rstrip() + table_header + "\n" + formatted + "\n"
+    else:
+        # MEMORY.md or other — plain append
+        new_content = current.rstrip() + formatted + "\n"
+
     return _safe_write(path, new_content)
 
 
