@@ -115,14 +115,15 @@ def _safe_json(path: str, default: Any = None) -> Any:
     except (json.JSONDecodeError, OSError):
         return default if default is not None else {}
 
-def _safe_write(path: str, content: str):
-    """Write a file, create parents, silent on failure."""
+def _safe_write(path: str, content: str) -> bool:
+    """Write a file, create parents, silent on failure. Returns True on success."""
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content)
+        return True
     except OSError:
-        pass
+        return False
 
 
 def _call_llm(

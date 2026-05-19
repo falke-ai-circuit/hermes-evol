@@ -231,7 +231,7 @@ class EvolConfig:
         # ── Set dataclass defaults (custom __init__ must do this explicitly) ──
         self.mode = "profile"
         self.enabled = True
-        self.edit_mode = "auto"
+        self.edit_mode = "suggested"
         self.phase_enabled = {
             "absorb": True, "reflect": True, "explore": True,
             "express": True, "memorize": True,
