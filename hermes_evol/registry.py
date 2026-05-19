@@ -742,7 +742,12 @@ def explore(cfg: EvolConfig, reflected: Dict[str, Any]) -> Dict[str, Any]:
 
     prompt_parts = [
         f"# EVOL EXPLORE — {cfg.profile}",
-        "Based on the following reflect findings, formulate 1-3 specific search queries.",
+        "Based on the reflect findings below, generate SHORT KEYWORD PHRASES for web search engines.",
+        "CRITICAL: Write 2-5 word keyword phrases, NOT full questions. Search engines match keywords, not interrogatives.",
+        '  GOOD: "multi-agent orchestration pattern"',
+        '  GOOD: "recursive self-improvement agents"',
+        '  BAD: "What are the critical gaps in understanding agent coordination?"',
+        '  BAD: "How do multi-agent systems handle recursive patterns of self-organization?"',
         "",
         "## Patterns Found",
     ]
@@ -761,13 +766,14 @@ def explore(cfg: EvolConfig, reflected: Dict[str, Any]) -> Dict[str, Any]:
         prompt_parts.append("")
     prompt_parts.append("## Instructions")
     prompt_parts.append("Return a JSON object with:")
-    prompt_parts.append('- queries: list of 1-3 specific search queries (strings) — base these on gaps FIRST, then patterns')
-    prompt_parts.append('- arxiv: list of 0-2 arXiv-specific search terms for academic papers')
+    prompt_parts.append('- queries: list of 1-3 keyword search phrases (2-5 words each, NOT questions) — derive from gaps FIRST, then patterns')
+    prompt_parts.append('- arxiv: list of 0-2 arXiv-specific search terms (keyword style, 2-4 words)')
     prompt_parts.append("Output ONLY valid JSON.")
 
     system = (
         f"You are the EXPLORE phase of EVOL for profile '{cfg.profile}'. "
-        f"Formulate search queries to discover new knowledge related to the patterns found."
+        f"Convert reflect findings into short keyword search phrases. "
+        f"NEVER produce full-sentence questions. Always 2-5 word keyword phrases."
     )
 
     raw = _call_llm("\n".join(prompt_parts), model_cfg, cfg, system_prompt=system)

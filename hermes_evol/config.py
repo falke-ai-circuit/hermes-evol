@@ -230,6 +230,7 @@ class EvolConfig:
         """Initialize EVOL config for a profile."""
         # ── Set dataclass defaults (custom __init__ must do this explicitly) ──
         self.mode = "profile"
+        self.operation_mode = "persistent"  # "persistent" | "session"
         self.enabled = True
         self.edit_mode = "suggested"
         self.phase_enabled = {
@@ -249,6 +250,17 @@ class EvolConfig:
         self.express_cooldown_hours = 12
         self.idle_trigger_minutes = 30
         self.activity_trigger_tasks = 1
+        self.phase_triggers = {  # cascading counter thresholds
+            "reflect": 3,
+            "express": 3,
+            "explore": 2,
+            "memorize": 2,
+        }
+        self.phase_trigger_threshold = 3
+        self.fallback_cycle_hours = 24
+        self.express_style = "creative"  # "creative" | "synthesis"
+        self.explore_query_limit = 3  # max queries per explore phase
+        self.session_scope = "role"  # "role" | "profile" — which circuit files absorb reads
         self.global_profiles = []
         self.search_backend = "wikipedia"
         self.search_backend_url = ""
@@ -374,6 +386,18 @@ class EvolConfig:
             self.idle_trigger_minutes = data["idle_trigger_minutes"]
         if "activity_trigger_tasks" in data:
             self.activity_trigger_tasks = data["activity_trigger_tasks"]
+        if "phase_triggers" in data:
+            self.phase_triggers = data["phase_triggers"]
+        if "fallback_cycle_hours" in data:
+            self.fallback_cycle_hours = data["fallback_cycle_hours"]
+        if "operation_mode" in data:
+            self.operation_mode = data["operation_mode"]
+        if "express_style" in data:
+            self.express_style = data["express_style"]
+        if "explore_query_limit" in data:
+            self.explore_query_limit = data["explore_query_limit"]
+        if "session_scope" in data:
+            self.session_scope = data["session_scope"]
         if "max_retries_per_phase" in data:
             self.max_retries_per_phase = data["max_retries_per_phase"]
         if "max_cycles_per_day" in data:

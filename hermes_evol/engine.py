@@ -187,9 +187,192 @@ def run_cycle(
 
     # ── Finalize ──
     _touch_last_cycle(cfg)
+    _append_evol_jsonl(cfg, result)
     result["duration_seconds"] = round(time.time() - t_start, 2)
 
     return result
+
+
+def run_session_cycle(
+    profile: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run a single-shot EVOL cycle for session mode (subagent task-end).
+
+    Designed for ephemeral agents: coder finishes a task, calls evol_task_end,
+    runs absorb→reflect→express→explore→memorize immediately, then exits.
+
+    Differences from persistent run_cycle:
+      - No cooldown checks (single-shot trigger)
+      - No heartbeat, no cascade counters, no idle depth
+      - Absorb: latest session + role circuit files only + role evol.jsonl
+      - Express: synthesis style (key insight articulated for explore)
+      - Explore: limited queries (default 1), single backend
+      - Memorize: role-scoped — writes to role MEMORY.md, skills, evol.jsonl
+        NEVER touches conductor circuit (SOUL.md/AGENTS.md/IDENTITY.md)
+    """
+    t_start = time.time()
+
+    try:
+        cfg = EvolConfig(profile=profile)
+    except Exception as e:
+        return {"status": "error", "profile": profile or "unknown", "error": f"Config load failed: {e}"}
+
+    result: Dict[str, Any] = {
+        "status": "ok",
+        "profile": cfg.profile,
+        "mode": "session",
+        "phases": {},
+        "duration_seconds": 0,
+    }
+
+    if not cfg.enabled:
+        return {**result, "status": "skipped", "reason": "EVOL disabled"}
+
+    # ═══ PHASE 1: ABSORB (session-scoped) ═══
+    if cfg.is_phase_enabled("absorb"):
+        try:
+            absorbed = _absorb_session(cfg, session_id)
+            result["phases"]["absorb"] = {
+                "status": "ok",
+                "sources_count": len(absorbed.get("circuit_files", {})),
+                "data": absorbed,
+            }
+        except Exception as e:
+            result["phases"]["absorb"] = {"status": "error", "error": str(e)}
+            return {**result, "status": "error", "error": f"absorb failed: {e}"}
+    else:
+        absorbed = {"profile": cfg.profile, "circuit_files": {}, "session_summary": ""}
+        result["phases"]["absorb"] = {"status": "skipped"}
+
+    # ═══ PHASE 2: REFLECT ═══
+    if cfg.is_phase_enabled("reflect"):
+        try:
+            reflected = _run_with_retry(reflect, cfg, absorbed, phase_name="reflect")
+            result["phases"]["reflect"] = {
+                "status": "ok",
+                "patterns": len(reflected.get("patterns", [])),
+                "anomalies": len(reflected.get("anomalies", [])),
+                "data": reflected,
+            }
+        except Exception as e:
+            result["phases"]["reflect"] = {"status": "error", "error": str(e)}
+            reflected = {"patterns": [], "anomalies": [], "bridge_signals": [], "circuit_health": {}}
+    else:
+        reflected = {"patterns": [], "anomalies": [], "bridge_signals": [], "circuit_health": {}}
+        result["phases"]["reflect"] = {"status": "skipped"}
+
+    # ═══ PHASE 3: EXPRESS (synthesis style) ═══
+    expressed = None
+    if cfg.is_phase_enabled("express"):
+        try:
+            expressed = _run_with_retry(express, cfg, reflected, None, phase_name="express",
+                                        style=cfg.express_style)
+            result["phases"]["express"] = {
+                "status": "ok",
+                "style": cfg.express_style,
+                "insights": len(expressed.get("insights", [])),
+                "data": expressed,
+            }
+        except Exception as e:
+            result["phases"]["express"] = {"status": "error", "error": str(e)}
+
+    # ═══ PHASE 4: EXPLORE (limited queries) ═══
+    explored = {"queries": [], "results": [], "discoveries": []}
+    if cfg.is_phase_enabled("explore"):
+        try:
+            explored = _run_with_retry(explore, cfg, reflected, phase_name="explore",
+                                       query_limit=cfg.explore_query_limit)
+            result["phases"]["explore"] = {
+                "status": "ok",
+                "queries": explored.get("queries", []),
+                "discoveries": len(explored.get("discoveries", [])),
+                "data": explored,
+            }
+        except Exception as e:
+            result["phases"]["explore"] = {"status": "error", "error": str(e)}
+
+    # ═══ PHASE 5: MEMORIZE (role-scoped) ═══
+    if cfg.is_phase_enabled("memorize"):
+        try:
+            memorized = _run_with_retry(memorize, cfg, reflected, expressed, explored,
+                                        phase_name="memorize", scope="role")
+            result["phases"]["memorize"] = {
+                "status": "ok",
+                "applied": len(memorized.get("applied", [])),
+                "proposed": len(memorized.get("proposals", [])),
+                "data": memorized,
+            }
+        except Exception as e:
+            result["phases"]["memorize"] = {"status": "error", "error": str(e)}
+    else:
+        result["phases"]["memorize"] = {"status": "skipped"}
+
+    result["duration_seconds"] = round(time.time() - t_start, 2)
+    _append_evol_jsonl(cfg, result)
+    return result
+
+
+def _absorb_session(cfg: EvolConfig, session_id: Optional[str] = None) -> Dict[str, Any]:
+    """Session-mode absorb: latest session + role circuit files + role evol.jsonl.
+    No idle depth. No gateway logs. No conductor circuit files."""
+    data: Dict[str, Any] = {
+        "profile": cfg.profile,
+        "timestamp": _utc_now(),
+        "session_summary": "",
+        "circuit_files": {},
+        "evolution_log": [],
+        "session_id": session_id,
+    }
+
+    # Role circuit files only (MEMORY.md for this role)
+    for fname in ["MEMORY.md"]:
+        path = cfg.get_circuit_path(fname)
+        content = _safe_read(path)
+        if content:
+            data["circuit_files"][fname] = content[:6000]
+
+    # Latest session data
+    sessions_dir = Path(cfg.profile_dir) / "sessions"
+    if sessions_dir.exists():
+        jsonl_files = sorted(sessions_dir.glob("*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if jsonl_files:
+            try:
+                lines = jsonl_files[0].read_text().splitlines()
+                msgs = []
+                for line in lines[-200:]:  # last 200 messages
+                    try:
+                        msg = json.loads(line)
+                        role = msg.get("role", "?")
+                        content = msg.get("content", "")[:300]
+                        if content:
+                            msgs.append(f"[{role}] {content}")
+                    except (json.JSONDecodeError, KeyError):
+                        pass
+                data["session_summary"] = "\n".join(msgs[-100:])  # cap at 100 messages
+            except (OSError, IOError):
+                data["session_summary"] = "[session data unavailable]"
+    else:
+        data["session_summary"] = "[no sessions directory]"
+
+    # Role evol.jsonl
+    evol_log = Path(cfg.profile_dir) / "evol.jsonl"
+    if evol_log.exists():
+        try:
+            entries = [json.loads(l) for l in evol_log.read_text().splitlines()[-10:]]
+            data["evolution_log"] = entries
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return data
+
+
+def _safe_read(path) -> str:
+    """Read file content safely, return empty string on failure."""
+    try:
+        return Path(path).read_text()
+    except (OSError, IOError):
+        return ""
 
 
 def _absorb_global(cfg: EvolConfig) -> Dict[str, Any]:
@@ -269,7 +452,17 @@ def _express_can_run(cfg: EvolConfig) -> bool:
 
 def _touch_last_cycle(cfg: EvolConfig):
     """Update the last cycle timestamp."""
-    marker = Path(cfg.profile_dir) / "evol" / ".last_cycle"
+    _touch_marker(cfg, "last_cycle")
+
+
+def _touch_last_express(cfg: EvolConfig):
+    """Update the last express timestamp."""
+    _touch_marker(cfg, "last_express")
+
+
+def _touch_marker(cfg: EvolConfig, name: str):
+    """Generic marker file writer. Creates evol/{name} timestamp."""
+    marker = Path(cfg.profile_dir) / "evol" / f".{name}"
     marker.parent.mkdir(parents=True, exist_ok=True)
     try:
         marker.write_text(str(time.time()))
@@ -277,12 +470,22 @@ def _touch_last_cycle(cfg: EvolConfig):
         pass
 
 
-def _touch_last_express(cfg: EvolConfig):
-    """Update the last express timestamp."""
-    marker = Path(cfg.profile_dir) / "evol" / ".last_express"
-    marker.parent.mkdir(parents=True, exist_ok=True)
+def _append_evol_jsonl(cfg: EvolConfig, cycle_result: Dict[str, Any]):
+    """Append a cycle result to the profile's evol.jsonl."""
+    log_path = Path(cfg.profile_dir) / "evol.jsonl"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": time.time(),
+        "type": cycle_result.get("mode", "cycle"),
+        "profile": cfg.profile,
+        "operation_mode": cfg.operation_mode,
+        "duration_seconds": cycle_result.get("duration_seconds", 0),
+        "phases": cycle_result.get("phases", {}),
+        "status": cycle_result.get("status", "error"),
+    }
     try:
-        marker.write_text(str(time.time()))
+        with open(log_path, "a") as f:
+            f.write(json.dumps(entry) + "\n")
     except OSError:
         pass
 
@@ -462,6 +665,15 @@ class EvolEngine:
         # Material buffer for absorb
         self._material_buffer: List[Dict] = []
 
+        # Per-phase cascading counters: absorb→reflect→express→explore→memorize
+        self._phase_counts: Dict[str, int] = {
+            "reflect": 0,   # incremented by absorb ticks
+            "express": 0,   # incremented by reflect completions
+            "explore": 0,   # incremented by express completions
+            "memorize": 0,  # incremented by explore completions
+        }
+        self._load_phase_counts()
+
     # ── Tool methods (return dicts — _wrap() in plugin.py serializes to JSON string) ──
 
     def status(self) -> Dict[str, Any]:
@@ -479,15 +691,18 @@ class EvolEngine:
         return self.cfg.to_dict()
 
     def speak(self, force: bool = False) -> Dict[str, Any]:
-        """Express phase — inner monologue + optional voice/portrait."""
+        """Express phase — inner monologue + optional voice/portrait.
+        Cascade: successful express → increment explore counter."""
         if not force and not self._express_enabled:
             return {"status": "skipped", "reason": "express disabled"}
         try:
-            # Quick absorb first
             absorbed = {"profile": self.profile, "mode": self.mode, "circuit_files": {}}
             reflected = {"patterns": [], "anomalies": [], "bridge_signals": [], "circuit_health": {}}
             result = express(self.cfg, reflected)
             self._set_cooldown("express")
+            # Cascade: express → increment explore counter
+            self._phase_counts["explore"] = self._phase_counts.get("explore", 0) + 1
+            self._save_phase_counts()
             return {"status": "ok", "data": result}
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -497,21 +712,48 @@ class EvolEngine:
         if not force and not self._reflect_enabled:
             return {"status": "skipped", "reason": "reflect disabled"}
         try:
-            absorbed = {"profile": self.profile, "mode": self.mode, "circuit_files": {}}
+            # Feed real material buffer from heartbeat absorb ticks
+            circuit_files = {}
+            session_summary = ""
+            if self._material_buffer:
+                for tick in self._material_buffer:
+                    if tick.get("type") == "absorb_tick":
+                        for f in tick.get("files", []):
+                            if f not in circuit_files:
+                                circuit_files[f] = ""
+                        session_summary += tick.get("summary", "")
+            
+            absorbed = {
+                "profile": self.profile,
+                "mode": self.mode,
+                "circuit_files": circuit_files,
+                "session_summary": session_summary,
+            }
             result = reflect(self.cfg, absorbed)
             self._set_cooldown("reflect")
+            # Cascade: successful reflect → increment express counter
+            self._phase_counts["express"] = self._phase_counts.get("express", 0) + 1
+            self._save_phase_counts()
+            # Write .last_reflect marker for chain detection
+            _touch_marker(self.cfg, "last_reflect")
+            # Clear material buffer after successful reflect
+            self._material_buffer.clear()
             return {"status": "ok", "data": result}
         except Exception as e:
             return {"status": "error", "error": str(e)}
 
     def explore(self, force: bool = False, query: str = "") -> Dict[str, Any]:
-        """Explore phase — search gaps discovered in reflect."""
+        """Explore phase — search gaps discovered in reflect.
+        Cascade: successful explore → increment memorize counter."""
         if not force and not self._explore_enabled:
             return {"status": "skipped", "reason": "explore disabled"}
         try:
             reflected = {"patterns": [], "anomalies": [], "bridge_signals": []}
             result = explore(self.cfg, reflected)
             self._set_cooldown("explore")
+            # Cascade: explore → increment memorize counter
+            self._phase_counts["memorize"] = self._phase_counts.get("memorize", 0) + 1
+            self._save_phase_counts()
             return {"status": "ok", "data": result}
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -533,13 +775,26 @@ class EvolEngine:
         if not force and not self._check_cooldown("memorize"):
             return {"status": "skipped", "reason": "cooldown"}
         try:
-            # Call memorize_standalone from registry with accumulated context
             from hermes_evol.registry import memorize as _memorize
             reflected = {"patterns": [], "anomalies": [], "bridge_signals": []}
             expressed = None
             explored = {"discoveries": [], "queries": []}
             result = _memorize(self.cfg, reflected, expressed, explored)
             self._set_cooldown("memorize")
+            return {"status": "ok", "data": result}
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+
+    def task_end(self, session_id: str = "") -> Dict[str, Any]:
+        """Session-mode EVOL — single-shot cycle for subagent task completion.
+        
+        Called by coder/reviewer/analyst/etc. after completing a task.
+        Runs absorb→reflect→express→explore→memorize immediately.
+        No heartbeat. No cascade. No idle depth.
+        Writes to role MEMORY.md, skills, evol.jsonl. Never conductor circuit.
+        """
+        try:
+            result = run_session_cycle(profile=self.profile, session_id=session_id or None)
             return {"status": "ok", "data": result}
         except Exception as e:
             return {"status": "error", "error": str(e)}
@@ -587,28 +842,55 @@ class EvolEngine:
             time.sleep(900)  # probe every 15 minutes regardless of cooldowns
 
     def _evaluate_all_triggers(self):
-        """Multi-gate trigger evaluation — content, activity, and idle-based."""
-        now = time.time()
-
-        # G1: Content-driven — material buffer overflow
-        if len(self._material_buffer) >= 5 and self._check_cooldown("reflect"):
+        """Cascading accumulator triggers — each phase counts up to its threshold,
+        then fires the NEXT phase downstream. Organic cascade, not full chain blast.
+        
+        Flow:
+        absorb ticks → reflect_counter++ → reflect fires → express_counter++
+        express fires → explore_counter++ → explore fires → memorize_counter++
+        memorize fires → circuit adapted
+        
+        Thresholds are per-phase configurable via evol.json phase_triggers dict.
+        """
+        thr = self.cfg.phase_triggers  # per-phase thresholds
+        
+        # G1: Absorb → Reflect
+        if self._phase_counts.get("reflect", 0) >= thr.get("reflect", 3) and self._check_cooldown("reflect"):
+            self._phase_counts["reflect"] = 0
+            self._save_phase_counts()
             self.reflect(force=True)
             return
-
-        # G2: Activity-based — kanban tasks completed since last cycle
+        
+        # G2: Reflect → Express
+        if self._phase_counts.get("express", 0) >= thr.get("express", 3) and self._check_cooldown("express"):
+            self._phase_counts["express"] = 0
+            self._save_phase_counts()
+            self.speak(force=True)
+            return
+        
+        # G3: Express → Explore
+        if self._phase_counts.get("explore", 0) >= thr.get("explore", 3) and self._check_cooldown("explore"):
+            self._phase_counts["explore"] = 0
+            self._save_phase_counts()
+            self.explore(force=True)
+            return
+        
+        # G4: Explore → Memorize
+        if self._phase_counts.get("memorize", 0) >= thr.get("memorize", 3) and self._check_cooldown("memorize"):
+            self._phase_counts["memorize"] = 0
+            self._save_phase_counts()
+            self.memorize(force=True)
+            return
+        
+        # G5: Activity-based — kanban tasks completed
         if self._activity_since_last_cycle() and self._check_cooldown("reflect"):
             self.reflect(force=True)
             return
-
-        # G3: Idle-based — Goran gone >6h, last EVOL >24h (guaranteed daily)
+        
+        # G6: Idle-based — organism dormant, guaranteed daily cycle
         if self._idle_long_enough() and self._check_cooldown("express"):
-            # Run full cycle when organism has been dormant
             self.full_cycle(force=True)
             return
-
-        # Express trigger after reflect completes
-        if self._check_cooldown("express") and self._reflect_just_completed():
-            self.speak(force=True)
 
     def _activity_since_last_cycle(self) -> bool:
         """Check if kanban tasks completed since last EVOL cycle."""
@@ -632,20 +914,20 @@ class EvolEngine:
             return False
 
     def _idle_long_enough(self) -> bool:
-        """Check if organism has been idle long enough for guaranteed daily cycle."""
+        """Check if organism has been idle long enough for guaranteed cycle."""
         marker = Path(self.cfg.profile_dir) / "evol" / ".last_cycle"
         if not marker.exists():
-            return True  # never ran — do it
+            return True
         try:
             last_ts = float(marker.read_text().strip())
             hours_since = (time.time() - last_ts) / 3600
-            return hours_since >= 24
+            return hours_since >= self.cfg.fallback_cycle_hours
         except Exception:
             return True
 
     def _reflect_just_completed(self) -> bool:
-        """Check if reflect phase just ran this tick."""
-        marker = Path(self.cfg.profile_dir) / "evol" / ".last_cycle"
+        """Check if reflect phase just ran (own marker, not .last_cycle)."""
+        marker = Path(self.cfg.profile_dir) / "evol" / ".last_reflect"
         if not marker.exists():
             return False
         try:
@@ -655,25 +937,60 @@ class EvolEngine:
             return False
 
     def _absorb_tick(self):
-        """Collect material from profile sources."""
+        """Collect material, increment reflect counter for cascade."""
         try:
             from .registry import absorb as _absorb
             absorbed = _absorb(self.cfg)
-            if absorbed.get("circuit_files"):
+            files = list(absorbed.get("circuit_files", {}).keys())
+            summary = absorbed.get("session_summary", "")
+            if files or summary:
                 self._material_buffer.append({
                     "ts": _utc_now(),
                     "type": "absorb_tick",
-                    "files": list(absorbed["circuit_files"].keys()),
+                    "files": files,
+                    "summary": summary[:2000],
                 })
+                # Each absorb tick feeds the reflect cascade
+                self._phase_counts["reflect"] = self._phase_counts.get("reflect", 0) + 1
+                self._save_phase_counts()
         except ImportError:
             from registry import absorb as _absorb
             absorbed = _absorb(self.cfg)
-            if absorbed.get("circuit_files"):
+            files = list(absorbed.get("circuit_files", {}).keys())
+            summary = absorbed.get("session_summary", "")
+            if files or summary:
                 self._material_buffer.append({
                     "ts": _utc_now(),
                     "type": "absorb_tick",
-                    "files": list(absorbed["circuit_files"].keys()),
+                    "files": files,
+                    "summary": summary[:2000],
                 })
+                self._phase_counts["reflect"] = self._phase_counts.get("reflect", 0) + 1
+                self._save_phase_counts()
+
+    # ── Phase Counter Persistence ──
+
+    def _counts_path(self) -> Path:
+        return Path(self.cfg.profile_dir) / "evol" / ".phase_counts.json"
+
+    def _save_phase_counts(self):
+        """Persist cascading counters to disk."""
+        try:
+            p = self._counts_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(self._phase_counts))
+        except (OSError, IOError):
+            pass
+
+    def _load_phase_counts(self):
+        """Restore cascading counters from disk on startup."""
+        try:
+            p = self._counts_path()
+            if p.exists():
+                loaded = json.loads(p.read_text())
+                self._phase_counts.update(loaded)
+        except (json.JSONDecodeError, OSError, IOError):
+            pass  # Use defaults
 
     # ── Cooldown ──
 
@@ -701,34 +1018,102 @@ class EvolEngine:
 
 
 def _build_status(engine: EvolEngine) -> Dict[str, Any]:
-    """Build status dict from EvolEngine state."""
-    last_cycle = Path(engine.cfg.profile_dir) / "evol" / ".last_cycle"
-    last_express = Path(engine.cfg.profile_dir) / "evol" / ".last_express"
-    idle_sec = 0  # approximate
-
-    def _read_ts(p: Path) -> Optional[str]:
+    """Build condensed EVOL status — per-phase readiness, trigger status, next milestone."""
+    now = time.time()
+    markers_dir = Path(engine.cfg.profile_dir) / "evol"
+    
+    def _read_ts(name: str) -> Optional[float]:
+        p = markers_dir / f".{name}"
         try:
-            return datetime.fromtimestamp(float(p.read_text().strip()), tz=timezone.utc).isoformat()
+            return float(p.read_text().strip())
         except Exception:
             return None
-
+    
+    def _fmt_ago(ts: Optional[float]) -> str:
+        if ts is None:
+            return "never"
+        sec = now - ts
+        if sec < 60:
+            return f"{int(sec)}s ago"
+        elif sec < 3600:
+            return f"{int(sec/60)}m ago"
+        elif sec < 86400:
+            return f"{int(sec/3600)}h ago"
+        return f"{int(sec/86400)}d ago"
+    
+    def _cooldown_ready(phase: str, cooldown_sec: float) -> str:
+        last = engine._cooldowns.get(phase, 0)
+        if last == 0:
+            return "✅ ready"
+        elapsed = now - last
+        if elapsed >= cooldown_sec:
+            return "✅ ready"
+        remaining = cooldown_sec - elapsed
+        if remaining < 60:
+            return f"⏳ {int(remaining)}s"
+        elif remaining < 3600:
+            return f"⏳ {int(remaining/60)}m"
+        return f"⏳ {int(remaining/3600)}h"
+    
+    # Absorb → Reflect cascade
+    thr = engine.cfg.phase_triggers
+    reflect_ct = engine._phase_counts.get("reflect", 0)
+    express_ct = engine._phase_counts.get("express", 0)
+    explore_ct = engine._phase_counts.get("explore", 0)
+    memorize_ct = engine._phase_counts.get("memorize", 0)
+    
+    # Absorb state
+    buffer_len = len(engine._material_buffer)
+    last_absorb = _read_ts("last_cycle")  # approximate
+    
+    # Reflect state
+    last_reflect = _read_ts("last_reflect")
+    reflect_cd = _cooldown_ready("reflect", 4 * 3600)
+    
+    # Express state
+    last_express = _read_ts("last_express") or engine._cooldowns.get("express", 0)
+    if not (isinstance(last_express, (int, float)) and last_express > 1700000000):
+        last_express = engine._cooldowns.get("express", 0)
+    express_cd = _cooldown_ready("express", engine.cfg.express_cooldown_hours * 3600)
+    
+    # Explore state
+    last_explore = engine._cooldowns.get("explore", 0)
+    explore_cd = _cooldown_ready("explore", 4 * 3600)
+    
+    # Memorize state
+    last_memorize = engine._cooldowns.get("memorize", 0)
+    memorize_cd = _cooldown_ready("memorize", 4 * 3600)
+    
+    # Next trigger estimate
+    triggers = []
+    if reflect_ct < thr.get("reflect", 3):
+        triggers.append(f"need {thr['reflect'] - reflect_ct} more absorb ticks → reflect")
+    if express_ct < thr.get("express", 3) and reflect_cd.startswith("✅"):
+        triggers.append(f"need {thr['express'] - express_ct} more reflects → express")
+    if explore_ct < thr.get("explore", 3) and express_cd.startswith("✅"):
+        triggers.append(f"need {thr['explore'] - explore_ct} more expresses → explore")
+    if memorize_ct < thr.get("memorize", 3) and explore_cd.startswith("✅"):
+        triggers.append(f"need {thr['memorize'] - memorize_ct} more explores → memorize")
+    
     return {
         "engine": "hermes-evol",
-        "version": "0.4.1",
+        "version": "0.4.2",
         "profile": engine.profile,
         "mode": engine.mode,
-        "heartbeat_alive": engine._running,
-        "state": "ACTIVE",
-        "idle_seconds": idle_sec,
-        "infra": {"disk_pct": 0, "providers_healthy": True},
-        "material_buffer_size": len(engine._material_buffer),
-        "cooldowns": {
-            "reflect": engine._cooldowns.get("reflect", 0),
-            "explore": engine._cooldowns.get("explore", 0),
-            "express": engine._cooldowns.get("express", 0),
-            "memorize": engine._cooldowns.get("memorize", 0),
+        "heartbeat": engine._running,
+        "cascade": {
+            "absorb→reflect": f"{reflect_ct}/{thr.get('reflect', 3)}",
+            "reflect→express": f"{express_ct}/{thr.get('express', 3)}",
+            "express→explore": f"{explore_ct}/{thr.get('explore', 3)}",
+            "explore→memorize": f"{memorize_ct}/{thr.get('memorize', 3)}",
         },
-        "phases": engine._phase_state(),
-        "last_cycle": _read_ts(last_cycle),
-        "last_express": _read_ts(last_express),
+        "flow": {
+            "absorb":  {"buffer": str(buffer_len), "last": _fmt_ago(last_absorb)},
+            "reflect":    {"status": reflect_cd, "last": _fmt_ago(last_reflect)},
+            "explore":    {"status": explore_cd, "last": _fmt_ago(last_explore if isinstance(last_explore, (int, float)) and last_explore > 100000 else None)},
+            "express":    {"status": express_cd, "last": _fmt_ago(last_express if isinstance(last_express, (int, float)) and last_express > 100000 else None)},
+            "memorize":   {"status": memorize_cd, "last": _fmt_ago(last_memorize if isinstance(last_memorize, (int, float)) and last_memorize > 100000 else None)},
+        },
+        "triggers": triggers or ["waiting for cooldowns"],
+        "chain_active": bool(last_reflect and (now - last_reflect) < 600),
     }

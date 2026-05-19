@@ -191,6 +191,22 @@ def register(ctx):
         emoji="🧬",
     )
 
+    ctx.register_tool(
+        "evol_task_end", "evol",
+        _build_schema(
+            params={
+                "session_id": {
+                    "type": "string",
+                    "description": "Optional session ID to attach to the cycle record",
+                }
+            },
+            required=[],
+        ),
+        _wrap(engine.task_end),
+        description="Run session-mode EVOL cycle on task completion. For subagent profiles (coder, reviewer, analyst, etc). Absorb→reflect→express→explore→memorize. Writes to role MEMORY.md, skills, and evol.jsonl. Never touches conductor circuit.",
+        emoji="🔚",
+    )
+
     # ── Register slash command ──
     ctx.register_command(
         "evol",
