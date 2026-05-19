@@ -862,28 +862,45 @@ def _execute_arxiv(terms: List[str]) -> List[Dict]:
 
 
 def _execute_searches(queries: List[str], cfg: EvolConfig) -> List[Dict]:
-    """Execute searches via configured backend (duckduckgo, wikipedia, searxng, firecrawl, google)."""
+    """Execute searches via ALL configured backends. Configure via evol.json:
+    { "search_backends": [{"name":"wikipedia"}, {"name":"searxng","url":"http://..."}, {"name":"arxiv"}] }
+    Falls back to single search_backend for backward compatibility."""
     results = []
-    backend = getattr(cfg, "search_backend", "duckduckgo")
-    backend_url = getattr(cfg, "search_backend_url", "")
-    api_key = getattr(cfg, "search_api_key", "")
+
+    # Build backend list from config
+    backends = getattr(cfg, "search_backends", None) or []
+    if not backends:
+        # Backward compat — single backend
+        backends = [{
+            "name": getattr(cfg, "search_backend", "wikipedia"),
+            "url": getattr(cfg, "search_backend_url", ""),
+            "key": getattr(cfg, "search_api_key", ""),
+        }]
 
     for query in queries:
-        try:
-            if backend == "duckduckgo":
-                results.extend(_search_duckduckgo(query))
-            elif backend == "wikipedia":
-                results.extend(_search_wikipedia(query))
-            elif backend == "searxng":
-                results.extend(_search_searxng(query, backend_url))
-            elif backend == "firecrawl":
-                results.extend(_search_firecrawl(query, api_key))
-            elif backend == "google":
-                results.extend(_search_google(query, api_key, backend_url))
-            else:
-                results.append({"query": query, "source": "config", "snippet": f"Unknown backend: {backend}"})
-        except Exception as e:
-            results.append({"query": query, "source": f"{backend}-error", "snippet": str(e)[:300]})
+        for be in backends:
+            name = be.get("name", "wikipedia")
+            url = be.get("url", "")
+            key = be.get("key", "")
+            try:
+                if name == "duckduckgo":
+                    results.extend(_search_duckduckgo(query))
+                elif name == "wikipedia":
+                    results.extend(_search_wikipedia(query))
+                elif name == "searxng":
+                    results.extend(_search_searxng(query, url))
+                elif name == "firecrawl":
+                    results.extend(_search_firecrawl(query, key))
+                elif name == "google":
+                    results.extend(_search_google(query, key, url))
+                elif name == "arxiv":
+                    results.extend(_execute_arxiv([query]))
+                elif name == "reddit":
+                    results.extend(_search_reddit(query))
+                else:
+                    results.append({"query": query, "source": name, "snippet": f"Unknown backend: {name}"})
+            except Exception as e:
+                results.append({"query": query, "source": f"{name}-error", "snippet": str(e)[:300]})
 
     return results
 
@@ -978,7 +995,7 @@ def _search_google(query: str, api_key: str, cx: str) -> List[Dict]:
     """Search via Google Custom Search API (requires API key + CX)."""
     if not api_key or not cx:
         return [{"query": query, "source": "google", "snippet": "Requires search_api_key AND search_backend_url (CX)."}]
-    url = f"https://www.googleapis.com/customsearch/v1?key={api_key}&cx={cx}&q={urllib.parse.quote(query)}&num=3"
+    url = f"https://www.googleapis.com/customsearch/v1?key=***&cx={cx}&q={urllib.parse.quote(query)}&num=3"
     data = _http_get_json(url, timeout=15)
     if "_error" in data:
         return [{"query": query, "source": "google-error", "snippet": data["_error"]}]
@@ -986,6 +1003,23 @@ def _search_google(query: str, api_key: str, cx: str) -> List[Dict]:
     for item in data.get("items", []):
         entries.append({"query": query, "source": item.get("link", ""), "snippet": item.get("snippet", "")[:500]})
     return entries or [{"query": query, "source": "google", "snippet": "No results"}]
+
+
+def _search_reddit(query: str) -> List[Dict]:
+    """Search Reddit via public JSON API — free, no key required."""
+    url = f"https://www.reddit.com/search.json?q={urllib.parse.quote(query)}&limit=3&sort=relevance"
+    data = _http_get_json(url, headers={"User-Agent": "EVOL/1.0"}, timeout=15)
+    if "_error" in data:
+        return [{"query": query, "source": "reddit-error", "snippet": data["_error"]}]
+    entries = []
+    for child in data.get("data", {}).get("children", [])[:3]:
+        d = child.get("data", {})
+        entries.append({
+            "query": query,
+            "source": f"https://reddit.com{d.get('permalink', '')}",
+            "snippet": f"r/{d.get('subreddit', '')}: {d.get('title', '')} {d.get('selftext', '')}",
+        })
+    return entries or [{"query": query, "source": "reddit", "snippet": "No results"}]
 
 
 def _analyze_discoveries(cfg: EvolConfig, results: List[Dict], model_cfg: PhaseModelConfig) -> List[Dict]:

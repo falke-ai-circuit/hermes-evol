@@ -216,10 +216,11 @@ class EvolConfig:
     # ── Global mode ──
     global_profiles: List[str] = field(default_factory=list)  # profiles to scan
 
-    # ── Search backend ──
+    # ── Search backends (configured per-instance via evol.json) ──
     search_backend: Literal["duckduckgo", "wikipedia", "searxng", "firecrawl", "google"] = "wikipedia"
     search_backend_url: str = ""    # SearXNG URL, Google CSE endpoint, etc.
     search_api_key: str = ""        # API key for firecrawl/google
+    search_backends: List[Dict[str, str]] = field(default_factory=list)  # multi-backend: [{name, url, key}]
 
     # ── Limits ──
     max_retries_per_phase: int = 3
@@ -252,6 +253,7 @@ class EvolConfig:
         self.search_backend = "wikipedia"
         self.search_backend_url = ""
         self.search_api_key = ""
+        self.search_backends = []
         self.max_retries_per_phase = 3
         self.max_cycles_per_day = 6
         self.profile_dir = ""
