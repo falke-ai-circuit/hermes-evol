@@ -1261,12 +1261,17 @@ def memorize(
         if items:
             print(f"    [evol] Retry successful — {len(items)} items scored")
         else:
-            # Retry failed — log the failure but don't crash
-            _safe_write(
-                str(Path(cfg.profile_dir) / "evol" / "memorize_failed.txt"),
-                f"memorize_empty_{_utc_now().replace(':','-')}\nraw1={raw[:500]}\nraw2={raw2[:500]}"
-            )
-            print(f"    [evol] Retry also returned 0 — logged failure")
+            # ── Rule-based fallback (v0.5.2): when LLM scoring returns empty twice,
+            # auto-promote high-weight findings directly. No LLM needed.
+            items = _rule_based_memorize(cfg, patterns, anomalies, bridge, insights, discoveries)
+            if items:
+                print(f"    [evol] Rule-based fallback — {len(items)} items auto-scored")
+            else:
+                _safe_write(
+                    str(Path(cfg.profile_dir) / "evol" / "memorize_failed.txt"),
+                    f"memorize_empty_{_utc_now().replace(':','-')}\nraw1={raw[:500]}\nraw2={raw2[:500]}"
+                )
+                print(f"    [evol] Retry also returned 0 — logged failure")
 
     # ── Cross-cycle pattern detection from evol.jsonl ──
     cross_cycle_patterns = _detect_cross_cycle_patterns(cfg)
@@ -1393,6 +1398,92 @@ def _build_memorize_prompt(
     parts.append("- Output ONLY the JSON object, no markdown wrapper")
 
     return "\n".join(parts)
+
+
+def _rule_based_memorize(
+    cfg,
+    patterns,
+    anomalies,
+    bridge,
+    insights,
+    discoveries,
+) -> list:
+    """v0.5.2: Rule-based scoring fallback when LLM returns empty.
+
+    Auto-promotes findings based on structural heuristics:
+    - Bridge paradoxes -> SOUL.md
+    - Patterns >= 0.75 -> MEMORY.md
+    - Anomalies >= 0.8 -> MEMORY.md
+    - Insights -> MEMORY.md (default 0.70)
+    - Discoveries >= 0.7 -> MEMORY.md
+    """
+    items = []
+
+    for b in bridge:
+        detail = b.get("detail", "")[:200]
+        if detail:
+            items.append({
+                "description": b.get("type", "bridge signal"),
+                "raw_weight": 0.85,
+                "target": "SOUL.md",
+                "action": "append",
+                "suggested_text": f"## Bridge Signal\n- **{b.get('type', '?')}**: {detail}\n",
+                "rationale": "auto: bridge paradox -> SOUL.md"
+            })
+
+    for p in patterns:
+        wt = p.get("weight", 0.5)
+        name = p.get("name", "")
+        evidence = p.get("evidence", "")[:150]
+        if wt >= 0.75 and name:
+            items.append({
+                "description": name,
+                "raw_weight": wt,
+                "target": "MEMORY.md",
+                "action": "append",
+                "suggested_text": f"\n\n§ {name} (wt:{wt:.2f})\n{evidence}\n",
+                "rationale": f"auto: pattern wt={wt:.2f} >= 0.75 -> MEMORY.md"
+            })
+
+    for a in anomalies:
+        sev = a.get("severity", 0)
+        signal = a.get("signal", "")
+        if sev >= 0.8 and signal:
+            items.append({
+                "description": signal,
+                "raw_weight": sev,
+                "target": "MEMORY.md",
+                "action": "append",
+                "suggested_text": f"\n\n§ {signal} (severity:{sev:.2f})\n",
+                "rationale": f"auto: anomaly severity={sev:.2f} >= 0.80 -> MEMORY.md"
+            })
+
+    for ins in insights:
+        if isinstance(ins, str) and len(ins) > 20:
+            items.append({
+                "description": ins[:100],
+                "raw_weight": 0.70,
+                "target": "MEMORY.md",
+                "action": "append",
+                "suggested_text": f"\n\n§ {ins[:200]}\n",
+                "rationale": "auto: express insight -> MEMORY.md"
+            })
+
+    for d in discoveries:
+        novelty = d.get("novelty", 0)
+        topic = d.get("topic", "")
+        finding = d.get("finding", "")[:200]
+        if novelty >= 0.7 and finding:
+            items.append({
+                "description": topic,
+                "raw_weight": novelty,
+                "target": "MEMORY.md",
+                "action": "append",
+                "suggested_text": f"\n\n§ {topic} (novelty:{novelty:.2f})\n{finding}\n",
+                "rationale": f"auto: discovery novelty={novelty:.2f} >= 0.70 -> MEMORY.md"
+            })
+
+    return items
 
 
 def _parse_memorize_items(raw: str, cfg: EvolConfig) -> List[Dict]:

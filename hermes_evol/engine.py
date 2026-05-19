@@ -1200,7 +1200,7 @@ def _build_status(engine: EvolEngine) -> Dict[str, Any]:
     
     return {
         "engine": "hermes-evol",
-        "version": "0.4.2",
+        "version": "0.5.2",
         "profile": engine.profile,
         "mode": engine.mode,
         "heartbeat": engine._running,
