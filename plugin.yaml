@@ -1,0 +1,21 @@
+name: hermes-evol
+version: 0.6.0
+description: "EVOL — Subconscious observer. Zero gateway dependency, direct LLM API calls, three-tier memory architecture. v0.6.0 — Per-agent EVOL v2: event-driven trigger (>3 tools + >2000 tokens), scoped absorb/memorize, AgentSessionTracker, 5-dimension conductor framing, G-FAIL-CHAIN-V2 (analyst at stage 2), global 24h idle fallback."
+author: falke-ai-circuit
+license: MIT
+entry_point: __init__.py
+min_hermes_version: "0.13.0"
+
+tools:
+  - evol_status
+  - evol_material
+  - evol_config
+  - evol_speak
+  - evol_reflect
+  - evol_explore
+  - evol_cycle
+  - evol_memorize
+  - evol_task_end
+
+commands:
+  - /evol
