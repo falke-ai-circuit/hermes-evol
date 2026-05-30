@@ -85,6 +85,15 @@
       "severity": "HIGH",
       "last_hit": "2026-05-18T16:00:00Z",
       "hits": 1
+    },
+    {
+      "id": "openhands-sandbox-secrets-auth",
+      "problem": "OpenHands sandbox requires secrets.json for GitHub auth — provider tokens in settings.json are not passed to agent containers",
+      "root_cause": "Provider tokens stored in settings.json remain in the host environment; OpenHands sandbox containers only receive secrets from secrets.json",
+      "fix": "Register GitHub tokens in secrets.json rather than relying on provider tokens from settings.json",
+      "severity": "MEDIUM",
+      "last_hit": "2026-05-30T06:29:45Z",
+      "hits": 1
     }
   ],
   "recent_changes": [
