@@ -1446,6 +1446,41 @@ class EvolEngine:
             self._set_cooldown("cycle")
             return
 
+        # G7: Per-agent auto-trigger — scan ALL agent trackers, fire when threshold met
+        if self._per_agent_auto_trigger():
+            return
+
+    def _per_agent_auto_trigger(self) -> bool:
+        """Scan all agent profiles, fire per-agent EVOL when >=3 session ends detected.
+        
+        Runs every heartbeat tick (15m). Agent-tracker-independent — no agent
+        needs to call evol_task_end(). The heartbeat detects session completions
+        in tracker JSONL files and fires automatically.
+        
+        Returns True if any agent cycle was fired (so caller can return early).
+        """
+        try:
+            from .stores import AgentSessionTracker
+            tracker = AgentSessionTracker()
+            profiles = self.cfg.global_profiles or self.cfg._discover_profiles()
+            
+            for prof in profiles:
+                if prof == self.profile:
+                    continue  # skip conductor self
+                try:
+                    min_c = getattr(self.cfg, 'per_agent_min_completions', 3)
+                    cooldown_h = getattr(self.cfg, 'per_agent_cooldown_hours', 4)
+                    if tracker.check_threshold(prof, min_c, cooldown_h):
+                        log.info("G7 auto-trigger: %s threshold met (%d completions) → firing per_agent_cycle", 
+                                 prof, min_c)
+                        run_per_agent_cycle(agent_profile=prof, cfg=self.cfg)
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return False
+
     def _activity_since_last_cycle(self) -> bool:
         """Check if kanban tasks completed since last EVOL cycle."""
         marker = Path(self.cfg.profile_dir) / "evol" / ".last_cycle"
