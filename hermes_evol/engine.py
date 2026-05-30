@@ -1154,7 +1154,7 @@ class EvolEngine:
             tracker.record_tool_call(target_profile)  # mark that work happened
             tracker.end_session(target_profile)
             
-            min_completions = getattr(self.cfg, 'per_agent_min_completions', 5)
+            min_completions = getattr(self.cfg, 'per_agent_min_completions', 3)
             cooldown_h = self.cfg.per_agent_cooldown_hours
             
             if tracker.check_threshold(target_profile, min_completions, cooldown_h):

@@ -239,7 +239,7 @@ class EvolConfig:
     activity_trigger_tasks: int = 1      # completed tasks before activity trigger
 
     # ── Per-agent EVOL (v2) ──
-    per_agent_min_completions: int = 5   # minimum agent completions (task_end calls) to trigger per-agent EVOL
+    per_agent_min_completions: int = 3   # minimum session ends (any type: kanban, task_end, evol_task_end) to trigger per-agent EVOL
     per_agent_cooldown_hours: int = 4    # cooldown between per-agent cycles for same agent
     per_agent_global_fallback_hours: int = 24  # global idle fallback: if no per-agent EVOL in this window AND idle > 2h
 
@@ -300,7 +300,7 @@ class EvolConfig:
         self.express_cooldown_hours = 12
         self.idle_trigger_minutes = 30
         self.activity_trigger_tasks = 1
-        self.per_agent_min_completions = 5
+        self.per_agent_min_completions = 3
         self.per_agent_cooldown_hours = 4
         self.per_agent_global_fallback_hours = 24
         self.phase_triggers = {  # cascading counter thresholds

@@ -201,12 +201,14 @@ class AgentSessionTracker:
     def check_threshold(
         self,
         agent_profile: str,
-        min_completions: int = 5,
+        min_completions: int = 3,
         cooldown_hours: int = 4,
     ) -> bool:
         """Check if per-agent EVOL should fire.
 
-        Reads the JSONL tracker file to count completions since last EVOL cycle.
+        Reads the JSONL tracker file to count SESSION ENDS (any type:
+        kanban_complete, task_end, evol_task_end) since last EVOL cycle.
+        No longer requires kanban specifically — any session completion counts.
         Returns True if: completions >= min_completions
         AND cooldown period has passed since last per-agent cycle.
 
