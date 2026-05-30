@@ -286,7 +286,7 @@ BACKEND_REGISTRY = {
 }
 
 
-def create_tier2_backend(config: Optional[Dict[str, Any]] = None) -> Tier2Backend:
+def create_tier2_backend(config: Optional[Dict[str, Any]] = None, profile: str = "conductor") -> Tier2Backend:
     """
     Create a Tier2 backend from configuration.
     
@@ -298,6 +298,9 @@ def create_tier2_backend(config: Optional[Dict[str, Any]] = None) -> Tier2Backen
       - EVOL_TIER2_BACKEND
       - EVOL_TIER2_URL
       - EVOL_TIER2_GROUP_ID
+    
+    profile: The agent profile name — used as the default group_id for per-agent
+             scoped memory. "conductor" is the global default for conductor cycles.
     """
     import os
     
@@ -307,7 +310,9 @@ def create_tier2_backend(config: Optional[Dict[str, Any]] = None) -> Tier2Backen
     
     if backend_name == "graphiti":
         url = backend_cfg.get("url") or os.environ.get("EVOL_TIER2_URL", "http://187.124.31.229:8000")
-        group_id = backend_cfg.get("group_id") or os.environ.get("EVOL_TIER2_GROUP_ID", "conductor")
+        # Default group_id = profile name (e.g. "researcher", "coder")
+        # Falls back to env var, then profile, then "conductor"
+        group_id = backend_cfg.get("group_id") or os.environ.get("EVOL_TIER2_GROUP_ID") or profile or "conductor"
         return GraphitiBackend(url=url, group_id=group_id)
     
     if backend_name == "dummy":
@@ -350,7 +355,8 @@ def run_promotion_demotion_cycle(
             "errors": int,
         }
     """
-    result = {"promoted": [], "demoted": [], "skipped": 0, "errors": 0}
+    backend_name = backend.name() if hasattr(backend, 'name') else str(backend)
+    result = {"promoted": [], "demoted": [], "skipped": 0, "errors": 0, "backend": backend_name}
     
     for fact in facts:
         weight = fact.get("weight", fact.get("raw_weight", 0))

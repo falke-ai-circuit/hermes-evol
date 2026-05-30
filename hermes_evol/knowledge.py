@@ -470,10 +470,13 @@ def memorize_agent(
     agent_profile: str,
     profiles_dir: str = None,
 ) -> Dict[str, Any]:
-    """Per-agent scoped memorize — writes ONLY to the target agent's SOUL.md.
+    """Per-agent scoped memorize — writes circuit-standard table entries to agent's files.
 
     NEVER touches conductor files or other agents' profiles.
-    Writes an Evolution Log entry to the agent's SOUL.md.
+    Every entry is a FILE-ADAPTED actionable instruction:
+      - SOUL.md → Evolution Log table row with concrete behavioral rule
+      - AGENTS.md → Gate table row with | G-NAME | When | Action |
+      - MEMORY.md → § Concept (wt:X.XX) with actionable one-liner definition
 
     Args:
         reflected: REFLECT phase output {patterns, anomalies, bridge_signals, ...}
@@ -482,10 +485,12 @@ def memorize_agent(
         agent_profile: Target agent (e.g. "coder")
         profiles_dir: Base profiles directory (default: ~/.hermes/profiles)
     """
+    import re
     base = Path(profiles_dir or os.path.expanduser("~/.hermes/profiles"))
     agent_dir = base / agent_profile
     soul_path = agent_dir / "SOUL.md"
     agents_path = agent_dir / "AGENTS.md"
+    memory_path = agent_dir / "MEMORY.md"
 
     result = {
         "status": "ok",
@@ -494,61 +499,59 @@ def memorize_agent(
         "proposals": [],
     }
 
-    # ── Build evolution log entry ──
     patterns = reflected.get("patterns", [])
     anomalies = reflected.get("anomalies", [])
     insights = expressed.get("insights", []) if expressed else []
     discoveries = explored.get("discoveries", [])
 
-    log_lines = [
-        f"\n---",
-        f"\n## Evolution Log Entry",
-        f"- timestamp: {_utc_now()}",
-        f"- patterns: {len(patterns)}",
-        f"- anomalies: {len(anomalies)}",
-        f"- insights: {len(insights)}",
-        f"- discoveries: {len(discoveries)}",
-    ]
+    today = _utc_now()[:10]
 
-    # Add top patterns
-    for p in patterns[:3]:
+    # ── Build file-adapted entries ──
+    for p in patterns[:5]:
         name = p.get("name", "unnamed") if isinstance(p, dict) else str(p)
         weight = p.get("weight", 0.5) if isinstance(p, dict) else 0.5
-        log_lines.append(f"- pattern: {name} (wt:{weight:.2f})")
+        finding = p.get("finding", p.get("description", "")) if isinstance(p, dict) else ""
+        suggestion = p.get("suggestion", p.get("fix", "")) if isinstance(p, dict) else ""
+        text = finding or suggestion or name
 
-    # Add top insights
-    for i in insights[:2]:
+        slug = re.sub(r'\s+', '-', name.strip().lower())[:60]
+
+        # SOUL.md → Evolution Log table row (what the agent should DO)
+        soul_row = f"| {today} | {slug} (wt:{weight:.2f}) | {text.strip()[:200]} |"
+        try:
+            _upsert_evol_log_row(soul_path, slug, soul_row)
+            result["applied"].append(f"SOUL.md: {slug}")
+        except Exception:
+            result["applied"].append(f"SOUL.md: write failed ({slug})")
+
+        # AGENTS.md → Gate table row with When/Action
+        gate_name = f"G-EVOL-{slug.upper().replace('-','_')[:40]}"
+        when = f"EVOL cycle detected {name}"
+        action = text.strip()[:150]
+        agents_row = f"| **{gate_name}** | **{when}** | **{action}** |"
+        try:
+            _upsert_gate_row(agents_path, gate_name, agents_row)
+            result["applied"].append(f"AGENTS.md: {gate_name}")
+        except Exception:
+            result["applied"].append(f"AGENTS.md: write failed ({gate_name})")
+
+    # ── Insights → MEMORY.md § entries ──
+    for i in insights[:3]:
         text = i if isinstance(i, str) else str(i)
-        log_lines.append(f"- insight: {text[:200]}")
-
-    log_entry = "\n".join(log_lines)
-
-    # ── Write to SOUL.md ──
-    try:
-        if soul_path.exists():
-            soul_content = soul_path.read_text()
-            soul_path.write_text(soul_content.rstrip() + "\n" + log_entry + "\n")
-        else:
-            soul_path.parent.mkdir(parents=True, exist_ok=True)
-            soul_path.write_text(
-                f"# SOUL.md — {agent_profile.title()}\n\n"
-                f"## Evolution Log\n{log_entry}\n"
-            )
-        result["applied"].append(f"SOUL.md: evolution log entry")
-    except OSError:
-        result["applied"].append("SOUL.md: write failed (OSError)")
-
-    # ── Write to AGENTS.md ──
-    try:
-        if agents_path.exists():
-            agents_content = agents_path.read_text()
-            # Only append if "Evolution Log" section exists
-            if "## Evolution Log" in agents_content:
-                agents_content += f"\n| {_utc_now()[:10]} | per-agent-evol | {len(patterns)} patterns, {len(discoveries)} discoveries |\n"
-                agents_path.write_text(agents_content)
-                result["applied"].append(f"AGENTS.md: evolution table row")
-    except OSError:
-        pass
+        slug = re.sub(r'\s+', '-', text.strip().lower())[:50]
+        entry = f"\n§ {slug} (wt:0.60)\n{text.strip()[:200]}\n"
+        try:
+            if memory_path.exists():
+                content = memory_path.read_text()
+                if f"§ {slug}" not in content:
+                    memory_path.write_text(content.rstrip() + "\n" + entry + "\n")
+                    result["applied"].append(f"MEMORY.md: {slug}")
+            else:
+                memory_path.parent.mkdir(parents=True, exist_ok=True)
+                memory_path.write_text(f"# MEMORY.md — {agent_profile.title()}\n\n{entry}\n")
+                result["applied"].append(f"MEMORY.md: {slug} (new)")
+        except Exception:
+            pass
 
     # ── Write to agent evol.jsonl ──
     evol_log_path = agent_dir / "evol.jsonl"
@@ -564,11 +567,82 @@ def memorize_agent(
         evol_log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(evol_log_path, "a") as f:
             f.write(json.dumps(cycle_entry, default=str) + "\n")
-        result["applied"].append(f"evol.jsonl: cycle entry")
+        result["applied"].append("evol.jsonl: cycle entry")
     except OSError:
         pass
 
     return result
+
+
+def _upsert_evol_log_row(path: Path, slug: str, new_row: str) -> None:
+    """Upsert an Evolution Log table row — update existing or append."""
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"---\nrole: {path.stem.split('.')[0]}\nlast_reflect: {_utc_now()[:10]}\nreflect_count: 0\n---\n\n# {path.name}\n\n## Evolution Log\n\n{new_row}\n")
+        return
+    content = path.read_text()
+    if f"| {slug} " in content:
+        # Replace existing row with same concept
+        lines = content.split('\n')
+        new_lines = []
+        for line in lines:
+            if line.startswith('|') and slug in line:
+                new_lines.append(new_row)
+            else:
+                new_lines.append(line)
+        path.write_text('\n'.join(new_lines))
+    else:
+        # Find ## Evolution Log section and append
+        if "## Evolution Log" in content:
+            # Append after the last existing table row in that section
+            idx = content.index("## Evolution Log")
+            post = content[idx:]
+            # Find insertion point — after header, before next section
+            lines_after = post.split('\n')
+            insert_at = idx + len("## Evolution Log\n") + len(lines_after[0]) + 1  # after header line
+            for i, line in enumerate(lines_after[1:], 1):
+                if line.startswith('#'):
+                    break
+                insert_at = idx + sum(len(l) + 1 for l in lines_after[:i+1])
+            new_content = content[:insert_at] + new_row + "\n" + content[insert_at:]
+            path.write_text(new_content)
+        else:
+            path.write_text(content.rstrip() + "\n\n## Evolution Log\n\n" + new_row + "\n")
+
+
+def _upsert_gate_row(path: Path, gate_name: str, new_row: str) -> None:
+    """Upsert a Gate table row in AGENTS.md — update existing or append."""
+    if not path.exists():
+        return
+    content = path.read_text()
+    gate_key = f"**{gate_name}**"
+    if gate_key in content:
+        # Replace existing row
+        lines = content.split('\n')
+        new_lines = []
+        for line in lines:
+            if gate_key in line:
+                new_lines.append(new_row)
+            else:
+                new_lines.append(line)
+        path.write_text('\n'.join(new_lines))
+    else:
+        # Append after last gate row in ## Gates section
+        if "## Gates" in content:
+            # Find the last gate row
+            lines = content.split('\n')
+            last_gate_idx = -1
+            for i, line in enumerate(lines):
+                if line.startswith('| **G-') or line.startswith('| G-'):
+                    last_gate_idx = i
+            if last_gate_idx >= 0:
+                lines.insert(last_gate_idx + 1, new_row)
+                path.write_text('\n'.join(lines))
+            else:
+                idx = content.index("## Gates")
+                post_newline = content.index('\n', idx)
+                next_newline = content.index('\n', post_newline + 1)
+                path.write_text(content[:next_newline+1] + new_row + '\n' + content[next_newline+1:])
 
 
 # ═══════════════════════════════════════════════════════════════════

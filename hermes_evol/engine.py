@@ -1440,9 +1440,10 @@ class EvolEngine:
             self.reflect(force=True)
             return
         
-        # G6: Idle-based — organism dormant, guaranteed daily cycle
+        # G6: Idle-based — organism dormant, guaranteed daily cycle (ALL profiles)
         if self._idle_long_enough() and self._check_cooldown("express"):
-            self.full_cycle(force=True)
+            result = run_cycle(profile=self.profile, mode="global", force=True)
+            self._set_cooldown("cycle")
             return
 
     def _activity_since_last_cycle(self) -> bool:

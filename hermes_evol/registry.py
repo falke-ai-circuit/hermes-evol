@@ -1593,7 +1593,18 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
 
     for item in items:
         raw_weight = item.get("raw_weight", 0)
-        target = item.get("target", "").strip()  # "CIRCUIT", "MEMORY.md", or "KNOWLEDGE"
+        target = item.get("target", "").strip()  # "SOUL.md", "AGENTS.md", "MEMORY.md", or "KNOWLEDGE"
+        # FIX: Default target based on weight if LLM didn't provide one
+        if not target:
+            wt = item.get("raw_weight", item.get("weight", 0))
+            if wt >= 0.85:
+                target = "SOUL.md"
+            elif wt >= 0.70:
+                target = "AGENTS.md"
+            elif wt >= 0.50:
+                target = "MEMORY.md"
+            else:
+                target = "MEMORY.md"  # low-weight → memory as catch-all
         suggested = item.get("suggested_text", "")
         concept = item.get("description", suggested[:80])
         domain = item.get("domain", kn._extract_domain(suggested, item.get("tags", [])))
