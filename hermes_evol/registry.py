@@ -1394,7 +1394,7 @@ def memorize(
         backend = t2.create_tier2_backend({
             "tier2_backend": getattr(cfg, "tier2_backend", "graphiti"),
             "tier2_config": getattr(cfg, "tier2_config", {}),
-        })
+        }, profile=cfg.profile)
         _vlog(cfg, 1, f"    TIER2 backend: {backend.name()} — health: {backend.health()}")
         
         # Convert EVOL scored items to tier2 facts
