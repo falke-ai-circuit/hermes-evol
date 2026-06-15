@@ -1,22 +1,21 @@
-"""
-EVOL Knowledge Layer — Three-Tier Cognitive Architecture.
+"""EVOL Knowledge Layer - Three-Tier Cognitive Architecture.
 
-Tier 3 (CIRCUIT):  SOUL.md · AGENTS.md · IDENTITY.md  — IDENTITY, per-profile
-Tier 2 (MEMORY):   MEMORY.md                           — ATTENTIVE, per-profile, ~8K cap
-Tier 1 (KNOWLEDGE): .hermes/knowledge/                 — ACCUMULATED, shared, wikilinked
+Tier 3 (CIRCUIT):  SOUL.md . AGENTS.md . IDENTITY.md . USER.md  -- IDENTITY, per-profile
+Tier 2 (MEMORY):   MEMORY.md                                      -- ATTENTIVE, per-profile, ~8K cap
+Tier 1 (KNOWLEDGE): .hermes/knowledge/                            -- ACCUMULATED, shared, wikilinked
 
 Movement rules:
-  Knowledge → Memory   ONLY path up. Can't skip to Circuit.
-  Memory → Circuit     Weight > promote_memory_to_circuit + identity match.
-  Circuit → Memory     Weight drops below demote_circuit_to_memory.
-  Memory → Knowledge   Weight drops below demote_memory_to_knowledge.
-  Knowledge → cleaned  Weight < phase_out threshold.
+  Knowledge -> Memory   ONLY path up. Can't skip to Circuit.
+  Memory -> Circuit     Weight > promote_memory_to_circuit + identity match.
+                        Route by content type: SOUL=doctrine, AGENTS=workflow,
+                        IDENTITY=personhood/firmware, USER=relational/Goran-facts.
+  Circuit -> Memory     Weight drops below demote_circuit_to_memory.
+  Memory -> Knowledge   Weight drops below demote_memory_to_knowledge.
+  Knowledge -> cleaned  Weight < phase_out threshold.
 
 Decay: exponential, kicks in after 7 days unused.
 Wikilinks: [[page-name]] bidirectional, auto-maintained.
-Domain clustering: automatic when 3+ files share domain tag.
-"""
-
+Domain clustering: automatic when 3+ files share domain tag."""
 import json
 import os
 import re
@@ -32,13 +31,22 @@ KNOWLEDGE_DIR = os.path.expanduser("~/.hermes/knowledge")
 # Tier transition thresholds (configurable per profile)
 THRESHOLDS = {
     "promote_knowledge_to_memory":  0.65,  # knowledge entry weight must exceed this
-    "promote_memory_to_circuit":    0.85,  # memory entry weight must exceed this
+    "promote_memory_to_circuit":    0.85,  # legacy catch-all — prefer per-file thresholds below
     "demote_circuit_to_memory":     0.50,  # circuit entry drops below → memory
     "demote_memory_to_knowledge":   0.40,  # memory entry drops below → knowledge
     "phase_out":                    0.15,  # knowledge entry below → delete
     "memory_capacity_chars":        8000,  # MEMORY.md cap
     "decay_rate":                   0.95,  # exponential decay factor per day
     "decay_grace_days":            7,      # no decay for first 7 days
+    # Per-file circuit thresholds — which weight gates promotion to each file
+    "per_file_threshold": {
+        "SOUL.md":      0.85,    # doctrine — highest bar, only core truths
+        "AGENTS.md":    0.70,    # workflow — lower bar, operational patterns
+        "IDENTITY.md":  0.75,    # personhood — mid bar, identity-shaping facts
+        "USER.md":      0.70,    # relational/Goran-facts — lower bar, user-context
+        "MEMORY.md":    0.50,    # memory — lowest bar, anything persistent enough
+        "CIRCUIT":      0.85,    # fallback for LLM-specified targets without filename
+    },
 }
 
 # ── Helpers ────────────────────────────────────────────────────────

@@ -1506,16 +1506,129 @@ def _parse_memorize_items(raw: str, cfg: EvolConfig) -> List[Dict]:
     return []
 
 
+def _route_by_content_type(concept: str, suggested: str, target: str, weight: float) -> str:
+    """Structural content-type routing. Falls back to LLM's target if no match.
+    
+    Returns the resolved target filename.
+    
+    Personhood markers -> IDENTITY.md: firmware, trait, self-model, identity
+    Doctrine markers -> SOUL.md: hard rule, non-negotiable, doctrine, reflex, soul
+    Workflow markers -> AGENTS.md: workflow, gate, task, operation, protocol
+    Relational markers -> USER.md: Goran, user, preference, relational, contact
+    Default: trust the LLM's target, or route to MEMORY.md if insufficient weight.
+    """
+    combined = (concept + " " + suggested).lower()
+    
+    # Personhood signals
+    personhood_markers = ['firmware', 'trait', 'personhood', 'identity', 'self-model',
+                          'who i am', 'core self', 'persona', 'i am']
+    if any(m in combined for m in personhood_markers):
+        return "IDENTITY.md"
+    
+    # Doctrine signals
+    doctrine_markers = ['doctrine', 'hard rule', 'non-negotiable', 'golden rule',
+                        'soul', 'reflex', 'conductor', 'lane', 'timeout',
+                        'autonomy', 'execution ban']
+    if any(m in combined for m in doctrine_markers):
+        return "SOUL.md"
+    
+    # Workflow signals
+    workflow_markers = ['workflow', 'gate', 'task', 'operation', 'protocol',
+                        'skill', 'pipeline', 'deployment', 'review', 'build']
+    if any(m in combined for m in workflow_markers):
+        return "AGENTS.md"
+    
+    # Relational/Goran signals
+    relational_markers = ['goran', 'gr15', 'user', 'preference', 'relational',
+                          'carbon', 'contact', 'human']
+    if any(m in combined for m in relational_markers):
+        return "USER.md"
+    
+    # Fallback: trust the LLM's target, but resolve generic targets
+    if target and target not in ("CIRCUIT", "KNOWLEDGE"):
+        return target
+    return "MEMORY.md"
+
+
+def _get_file_threshold(target_file: str) -> float:
+    """Get the per-file weight threshold from THRESHOLDS."""
+    try:
+        from . import knowledge as kn_local
+    except ImportError:
+        import knowledge as kn_local  # type: ignore
+    per_file = kn_local.THRESHOLDS.get("per_file_threshold", {})
+    return per_file.get(target_file, kn_local.THRESHOLDS["promote_memory_to_circuit"])
+
+
+def _reconstructive_reevaluate(cfg: EvolConfig, concept: str, raw_weight: float) -> float:
+    """Re-evaluate existing MEMORY.md entries for the same concept.
+    
+    Bartlett's reconstructive memory: if a prior entry exists with the same concept,
+    boost the weight (reinforcement) or drop it (contradiction).
+    Returns adjusted weight.
+    """
+    try:
+        from . import knowledge as kn_local
+    except ImportError:
+        import knowledge as kn_local  # type: ignore
+    
+    memory_path = cfg.get_circuit_path("MEMORY.md")
+    content = kn_local._safe_read(memory_path)
+    if not content:
+        return raw_weight
+    
+    # Find existing entries for this concept (case-insensitive partial match)
+    import re
+    concept_lower = concept.lower().strip()
+    # Pattern: § concept-name (wt:X.XX)
+    pattern = re.compile(
+        r'§\s+([^\n]+?)\s+\(wt:(\d+\.\d+)\)\n(.*?)(?=\n§|\Z)',
+        re.DOTALL | re.IGNORECASE
+    )
+    
+    matches = []
+    for m in pattern.finditer(content):
+        existing_concept = m.group(1).strip().lower()
+        existing_weight = float(m.group(2))
+        # Match if concept is a substring or exact match
+        if concept_lower in existing_concept or existing_concept in concept_lower:
+            matches.append(existing_weight)
+    
+    if not matches:
+        return raw_weight
+    
+    # Reinforcement: if 3+ prior entries, boost
+    if len(matches) >= 3:
+        boost = min(0.05 * len(matches), 0.20)
+        return min(raw_weight + boost, 1.0)
+    # Single prior: slight reinforcement
+    elif len(matches) >= 1:
+        return min(raw_weight + 0.03, 1.0)
+    
+    return raw_weight
+
+
 def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
     """
-    Three-tier promotion engine.
+    Three-tier promotion engine with per-file thresholds and content-type routing.
     
     Movement:
-      Knowledge → Memory   (wt > promote_knowledge_to_memory)
-      Memory → Circuit     (wt > promote_memory_to_circuit + identity match)
-      Circuit → Memory     (wt < demote_circuit_to_memory)
-      Memory → Knowledge   (wt < demote_memory_to_knowledge)
-      Knowledge → cleaned  (wt < phase_out)
+      Knowledge -> Memory   (wt > promote_knowledge_to_memory)
+      Memory -> Circuit     (wt > per_file_threshold[target] + identity match)
+      Circuit -> Memory     (wt < demote_circuit_to_memory)
+      Memory -> Knowledge   (wt < demote_memory_to_knowledge)
+      Knowledge -> cleaned  (wt < phase_out)
+    
+    Per-file thresholds (from knowledge.py):
+      SOUL.md:      0.85 — doctrine (highest bar)
+      AGENTS.md:    0.70 — workflow
+      IDENTITY.md:  0.75 — personhood
+      USER.md:      0.70 — relational/Goran-facts
+      MEMORY.md:    0.50 — persistent facts
+    
+    Content-type routing: structural detection of what kind of fact this is,
+    routing to the correct file regardless of LLM-specified target.
+    Falls back to LLM's target if no structural match.
     
     Returns (applied: list, proposals: list).
     """
@@ -1530,7 +1643,7 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
 
     for item in items:
         raw_weight = item.get("raw_weight", 0)
-        target = item.get("target", "").strip()  # "CIRCUIT", "MEMORY.md", or "KNOWLEDGE"
+        target = item.get("target", "").strip()  # "CIRCUIT", "MEMORY.md", "SOUL.md", etc.
         suggested = item.get("suggested_text", "")
         concept = item.get("description", suggested[:80])
         domain = item.get("domain", kn._extract_domain(suggested, item.get("tags", [])))
@@ -1539,35 +1652,43 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
         if not suggested:
             continue
 
-        tier = target.upper()
+        # Reconstructive re-evaluation: check MEMORY.md for prior entries
+        raw_weight = _reconstructive_reevaluate(cfg, concept, raw_weight)
+
+        # Content-type routing: resolve the actual target file
+        target_file = _route_by_content_type(concept, suggested, target, raw_weight)
+
+        tier = target_file.upper() if target_file in ("SOUL.md", "AGENTS.md", "IDENTITY.md", "USER.md") else target.upper()
         promotion_base = {
             "weight": raw_weight,
             "concept": concept,
             "suggested_text": suggested,
             "target_tier": tier,
+            "target_file": target_file,
         }
 
-        # ── Tier 3: CIRCUIT ──────────────────────────────────────
-        if tier == "CIRCUIT" or target in ("SOUL.md", "AGENTS.md", "IDENTITY.md"):
-            threshold = cfg.get_circuit_weight(target if target != "CIRCUIT" else "SOUL.md")
+        # ── Tier 3: CIRCUIT (SOUL.md, AGENTS.md, IDENTITY.md, USER.md) ──
+        if target_file in ("SOUL.md", "AGENTS.md", "IDENTITY.md", "USER.md"):
+            threshold = _get_file_threshold(target_file)
             promotion = {
                 **promotion_base,
-                "file": target if target != "CIRCUIT" else "SOUL.md",
+                "file": target_file,
                 "threshold": threshold,
                 "action": item.get("action", "append"),
             }
 
-            if raw_weight < kn.THRESHOLDS["promote_memory_to_circuit"]:
-                # Below circuit threshold — write to memory instead
+            if raw_weight < threshold:
+                # Below file's threshold — write to MEMORY.md instead
                 memory_path = cfg.get_circuit_path("MEMORY.md")
-                entry = f"\n\n§ {concept} (wt:{raw_weight:.2f})\n{suggested}\n"
+                entry = f"\n\n§ {concept} (wt:{raw_weight:.2f} ⬆ candidate for {target_file})\n{suggested}\n"
                 if kn._safe_write(memory_path, kn._safe_read(memory_path) + entry):
-                    proposals.append({**promotion, "routed_to": "MEMORY.md", "note": "below circuit threshold"})
+                    proposals.append({**promotion, "routed_to": "MEMORY.md",
+                                     "note": f"below {target_file} threshold ({raw_weight:.2f} < {threshold})"})
                 else:
                     proposals.append({**promotion, "routed_to": "MEMORY.md", "note": "write failed"})
                 continue
 
-            # Apply to circuit
+            # Apply to the resolved circuit file
             if cfg.edit_mode == "auto":
                 success = _apply_circuit_edit(
                     cfg, promotion["file"], suggested,
@@ -1575,7 +1696,8 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
                     concept=concept, weight=raw_weight
                 )
                 if success:
-                    applied.append({**promotion, "applied": True, "tier": "circuit"})
+                    applied.append({**promotion, "applied": True, "tier": "circuit",
+                                   "routed_by": "content-type" if target_file != target else "llm"})
                 else:
                     proposals.append({**promotion, "status": "failed"})
             elif cfg.edit_mode == "suggested":
@@ -1585,23 +1707,33 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
                 proposals.append({**promotion, "note": "readonly"})
 
         # ── Tier 2: MEMORY.md ────────────────────────────────────
-        elif tier == "MEMORY" or target == "MEMORY.md":
+        elif tier == "MEMORY" or target_file == "MEMORY.md":
             memory_path = cfg.get_circuit_path("MEMORY.md")
             threshold = kn.THRESHOLDS["demote_memory_to_knowledge"]
             promotion = {**promotion_base, "file": "MEMORY.md", "threshold": threshold}
 
-            if raw_weight > kn.THRESHOLDS["promote_memory_to_circuit"]:
-                # Candidate for circuit promotion — propose it
-                proposals.append({**promotion, "candidate_for": "CIRCUIT", "note": "exceeds circuit threshold, needs identity match check"})
-                # Also write to memory
-                entry = f"\n\n§ {concept} (wt:{raw_weight:.2f} ⬆ circuit candidate)\n{suggested}\n"
+            # Check if candidate for circuit promotion
+            circuit_candidate_for = None
+            best_threshold = 0
+            per_file = kn.THRESHOLDS.get("per_file_threshold", {})
+            for fname, fthresh in per_file.items():
+                if fname == "CIRCUIT":
+                    continue
+                if raw_weight >= fthresh and fthresh > best_threshold:
+                    circuit_candidate_for = fname
+                    best_threshold = fthresh
+
+            if circuit_candidate_for:
+                proposals.append({**promotion,
+                                 "candidate_for": circuit_candidate_for,
+                                 "note": f"exceeds {circuit_candidate_for} threshold ({raw_weight:.2f} >= {best_threshold})"})
+                entry = f"\n\n§ {concept} (wt:{raw_weight:.2f} ⬆ candidate for {circuit_candidate_for})\n{suggested}\n"
                 kn._safe_write(memory_path, kn._safe_read(memory_path) + entry)
             elif raw_weight < threshold:
-                # Demote to knowledge
                 kn.create_knowledge(concept, suggested, domain=domain, tags=tags, weight=raw_weight)
-                proposals.append({**promotion, "routed_to": "KNOWLEDGE", "note": f"demoted — weight {raw_weight:.2f} < {threshold}"})
+                proposals.append({**promotion, "routed_to": "KNOWLEDGE",
+                                 "note": f"demoted — weight {raw_weight:.2f} < {threshold}"})
             else:
-                # Standard memory append
                 entry = f"\n\n§ {concept} (wt:{raw_weight:.2f})\n{suggested}\n"
                 if kn._safe_write(memory_path, kn._safe_read(memory_path) + entry):
                     applied.append({**promotion, "applied": True, "tier": "memory"})
@@ -1615,17 +1747,15 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
             promote_to_mem = kn.THRESHOLDS["promote_knowledge_to_memory"]
 
             if raw_weight > promote_to_mem:
-                # Promote to memory
                 memory_path = cfg.get_circuit_path("MEMORY.md")
                 entry = f"\n\n§ {concept} (wt:{raw_weight:.2f} ⬆ from knowledge)\n{suggested}\n"
                 kn._safe_write(memory_path, kn._safe_read(memory_path) + entry)
                 applied.append({**promotion, "applied": True, "tier": "memory", "note": "promoted from knowledge"})
             elif raw_weight < phase_out:
-                # Phase out completely
                 kn.delete_knowledge(kn._slugify(concept), domain)
-                proposals.append({**promotion, "action": "deleted", "note": f"phased out — weight {raw_weight:.2f} < {phase_out}"})
+                proposals.append({**promotion, "action": "deleted",
+                                 "note": f"phased out — weight {raw_weight:.2f} < {phase_out}"})
             else:
-                # Standard knowledge create/update
                 kp = kn.create_knowledge(concept, suggested, domain=domain, tags=tags, weight=raw_weight)
                 applied.append({**promotion, "applied": True, "tier": "knowledge", "path": kp})
 
@@ -1633,7 +1763,6 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
             proposals.append({**promotion_base, "note": f"unknown target '{target}'"})
 
     # ── Post-cycle maintenance ──
-    # Apply decay to all knowledge entries
     for entry in kn.list_knowledge():
         new_wt = kn.decay_weight(entry['last_used'], entry['weight'])
         if new_wt != entry['weight']:
@@ -1647,10 +1776,7 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
                     "note": f"decayed from {entry['weight']:.2f} to {new_wt:.2f} — phased out",
                 })
 
-    # Manage MEMORY.md capacity
     kn.manage_memory_capacity(cfg.get_circuit_path("MEMORY.md"))
-
-    # Rebuild knowledge index
     kn.rebuild_index()
 
     return applied, proposals
@@ -1659,19 +1785,17 @@ def _apply_promotions(cfg: EvolConfig, items: List[Dict]) -> tuple:
 def _format_circuit_entry(filename: str, concept: str, text: str, weight: float) -> str:
     """
     Format a circuit file append in standard CIRCUIT format (circuit-file-editing skill).
-    SOUL.md / IDENTITY.md / AGENTS.md → Evolution Log table row
-    MEMORY.md → § marker + table row in Core Patterns
+    SOUL.md / IDENTITY.md / AGENTS.md / USER.md -> Evolution Log table row
+    MEMORY.md -> § marker + table row in Core Patterns
     """
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     slug = concept.strip().replace("\n", " ")[:80]
 
-    if filename in ("SOUL.md", "IDENTITY.md", "AGENTS.md"):
+    if filename in ("SOUL.md", "IDENTITY.md", "AGENTS.md", "USER.md"):
         # Standard Evolution Log table row
         return f"| {today} | {slug} (wt:{weight:.2f}) | {text.strip()[:200]} |"
-
     elif filename == "MEMORY.md":
         return f"\n§ {slug} (wt:{weight:.2f})\n{text.strip()}\n"
-
     else:
         # Generic: § marker
         return f"\n§ {slug} (wt:{weight:.2f})\n{text.strip()}\n"
@@ -1712,7 +1836,7 @@ def _apply_circuit_edit(cfg: EvolConfig, filename: str, text: str, action: str,
         return False
 
     # Append to the correct section
-    if filename in ("SOUL.md", "IDENTITY.md", "AGENTS.md"):
+    if filename in ("SOUL.md", "IDENTITY.md", "AGENTS.md", "USER.md"):
         # Find ## Evolution Log section, append table row
         evo_section = "## Evolution Log"
         if evo_section in current:
@@ -1790,17 +1914,20 @@ def _detect_cross_cycle_patterns(cfg: EvolConfig) -> List[Dict]:
     for pname, cycles in pattern_cycles.items():
         if len(cycles) >= 3:
             # Recurring across 3+ cycles — promote to circuit
+            # Route by content type instead of hardcoding AGENTS.md
+            weight = min(0.85 + (len(cycles) - 3) * 0.03, 0.98)
+            target_file = _route_by_content_type(pname, pname, "AGENTS.md", weight)
             detected.append({
                 "pattern": pname,
                 "cycles": len(cycles),
-                "weight": min(0.85 + (len(cycles) - 3) * 0.03, 0.98),
+                "weight": weight,
                 "text": (
                     f"CROSS-CYCLE PATTERN (recurred {len(cycles)}x): {pname}. "
                     f"This pattern has been detected across {len(cycles)} separate EVOL cycles "
                     f"without resolution. It is now a structural fixture of the organism. "
                     f"Auto-detected by MEMORIZE cross-cycle analyzer."
                 ),
-                "target": "AGENTS.md",
+                "target": target_file,
             })
 
     return detected
