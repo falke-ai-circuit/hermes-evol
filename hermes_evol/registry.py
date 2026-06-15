@@ -1533,6 +1533,8 @@ _MARKER_WEIGHTS = {
         ("review", 1), ("build", 1),
     ],
     "USER.md": [
+        ("gr15 corrected", 4), ("gr15 explicitly", 4), ("goran corrected", 4),
+        ("goran explicitly", 4), ("gr15 prefers", 4),
         ("goran", 3), ("gr15", 3), ("user preference", 3),
         ("carbon self", 3),
         ("user", 2), ("preference", 2), ("relational", 2),
