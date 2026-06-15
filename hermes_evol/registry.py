@@ -1506,48 +1506,90 @@ def _parse_memorize_items(raw: str, cfg: EvolConfig) -> List[Dict]:
     return []
 
 
+# ── Weighted marker definitions for content-type routing ──────────
+# Format: (marker_string, weight) — heavier markers are stronger signals
+# Weights: 3 = near-certain (e.g. "hard rule"), 2 = strong (e.g. "doctrine"),
+#          1 = suggestive (e.g. "soul" could be metaphorical)
+
+_MARKER_WEIGHTS = {
+    "IDENTITY.md": [
+        ("firmware trait", 3), ("who i am", 3), ("core self", 3),
+        ("core identity", 3), ("self-model", 2), ("personhood", 2),
+        ("firmware", 2), ("trait", 1), ("identity", 1),
+        ("persona", 1), ("i am", 1),
+    ],
+    "SOUL.md": [
+        ("hard rule", 3), ("non-negotiable", 3), ("golden rule", 3),
+        ("execution ban", 3), ("lane doctrine", 3),
+        ("contact field", 3), ("bridge", 2),
+        ("doctrine", 2), ("reflex", 2), ("autonomy", 2),
+        ("conductor", 1), ("soul", 1), ("timeout", 1),
+    ],
+    "AGENTS.md": [
+        ("workflow gate", 3), ("pipeline", 3), ("deployment", 3),
+        ("code review", 3), ("task lane", 3),
+        ("workflow", 2), ("gate", 2), ("operation", 2),
+        ("protocol", 2), ("skill", 2), ("task", 1),
+        ("review", 1), ("build", 1),
+    ],
+    "USER.md": [
+        ("goran", 3), ("gr15", 3), ("user preference", 3),
+        ("carbon self", 3),
+        ("user", 2), ("preference", 2), ("relational", 2),
+        ("human", 1), ("carbon", 1),
+    ],
+}
+
+# Minimum score threshold — if no category reaches this, trust the LLM
+_MIN_ROUTING_SCORE = 2
+
+
 def _route_by_content_type(concept: str, suggested: str, target: str, weight: float) -> str:
-    """Structural content-type routing. Falls back to LLM's target if no match.
+    """Structural content-type routing with weighted scoring.
+    
+    Uses weighted keyword scoring across four categories:
+      IDENTITY.md — personhood, firmware, self-model
+      SOUL.md     — doctrine, hard rules, reflexes
+      AGENTS.md   — workflow, gates, operations
+      USER.md     — relational/Goran facts, preferences
     
     Returns the resolved target filename.
     
-    Personhood markers -> IDENTITY.md: firmware, trait, self-model, identity
-    Doctrine markers -> SOUL.md: hard rule, non-negotiable, doctrine, reflex, soul
-    Workflow markers -> AGENTS.md: workflow, gate, task, operation, protocol
-    Relational markers -> USER.md: Goran, user, preference, relational, contact
-    Default: trust the LLM's target, or route to MEMORY.md if insufficient weight.
+    Scoring rules:
+    - Each marker hit adds its weight to the category score
+    - Multiple hits in one category compound (e.g., "hard rule" + "doctrine" = 5 points)
+    - Highest-scoring category wins
+    - If no category reaches _MIN_ROUTING_SCORE, fall back to LLM's target
+    - Ties go to the LLM's target (don't override without clear signal)
     """
     combined = (concept + " " + suggested).lower()
+    # Normalize hyphens/underscores to spaces for multi-word marker matching
+    combined_normalized = combined.replace("-", " ").replace("_", " ")
     
-    # Personhood signals
-    personhood_markers = ['firmware', 'trait', 'personhood', 'identity', 'self-model',
-                          'who i am', 'core self', 'persona', 'i am']
-    if any(m in combined for m in personhood_markers):
-        return "IDENTITY.md"
+    scores = {}
+    for category, markers in _MARKER_WEIGHTS.items():
+        score = 0
+        for marker, marker_weight in markers:
+            # Try exact match first, then normalized match for multi-word markers
+            if marker in combined or (" " in marker and marker in combined_normalized):
+                score += marker_weight
+        scores[category] = score
     
-    # Doctrine signals
-    doctrine_markers = ['doctrine', 'hard rule', 'non-negotiable', 'golden rule',
-                        'soul', 'reflex', 'conductor', 'lane', 'timeout',
-                        'autonomy', 'execution ban']
-    if any(m in combined for m in doctrine_markers):
-        return "SOUL.md"
+    # Find the highest-scoring category
+    best_category = max(scores, key=scores.get)
+    best_score = scores[best_category]
     
-    # Workflow signals
-    workflow_markers = ['workflow', 'gate', 'task', 'operation', 'protocol',
-                        'skill', 'pipeline', 'deployment', 'review', 'build']
-    if any(m in combined for m in workflow_markers):
-        return "AGENTS.md"
+    # Second-highest for tie detection
+    sorted_scores = sorted(scores.values(), reverse=True)
+    is_tie = len(sorted_scores) > 1 and sorted_scores[0] == sorted_scores[1]
     
-    # Relational/Goran signals
-    relational_markers = ['goran', 'gr15', 'user', 'preference', 'relational',
-                          'carbon', 'contact', 'human']
-    if any(m in combined for m in relational_markers):
-        return "USER.md"
+    # Below minimum threshold or tie: trust the LLM
+    if best_score < _MIN_ROUTING_SCORE or is_tie:
+        if target and target not in ("CIRCUIT", "KNOWLEDGE"):
+            return target
+        return "MEMORY.md"
     
-    # Fallback: trust the LLM's target, but resolve generic targets
-    if target and target not in ("CIRCUIT", "KNOWLEDGE"):
-        return target
-    return "MEMORY.md"
+    return best_category
 
 
 def _get_file_threshold(target_file: str) -> float:
